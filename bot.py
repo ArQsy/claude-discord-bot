@@ -240,6 +240,8 @@ def _parse_reminder(text):
 
 # ───────────── ユーティリティ ─────────────
 
+_BROWSER_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
+
 def _extract_coords(text):
     """テキスト中のGoogle Maps URLから座標を抽出"""
     patterns = [
@@ -247,20 +249,28 @@ def _extract_coords(text):
         r'/@(-?\d+\.\d+),(-?\d+\.\d+)',
         r'll=(-?\d+\.\d+),(-?\d+\.\d+)',
         r'!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)',
+        r'center=(-?\d+\.\d+)%2C(-?\d+\.\d+)',
     ]
-    urls = re.findall(r'https?://[^\s]+', text)
+    urls = re.findall(r'https?://\S+', text)
     for url in urls:
-        # 短縮URLはリダイレクト先を取得
-        if 'goo.gl' in url or 'maps.app' in url:
-            try:
-                r = requests.get(url, allow_redirects=True, timeout=5)
-                url = r.url
-            except Exception:
-                pass
+        # まずURLそのままで試す
         for pat in patterns:
             m = re.search(pat, url)
             if m:
                 return float(m.group(1)), float(m.group(2))
+        # 短縮URLはリダイレクト先を追跡
+        if 'goo.gl' in url or 'maps.app' in url:
+            try:
+                r = requests.get(url, allow_redirects=True, timeout=8,
+                                 headers={'User-Agent': _BROWSER_UA})
+                expanded = r.url
+                print(f"展開URL: {expanded}")
+                for pat in patterns:
+                    m = re.search(pat, expanded)
+                    if m:
+                        return float(m.group(1)), float(m.group(2))
+            except Exception as e:
+                print(f"URL展開失敗: {e}")
     return None, None
 
 
@@ -507,16 +517,24 @@ async def on_message(message):
                     await message.reply(f"{BOT_PREFIX}Google Maps APIキーが設定されていません。")
                     return
 
-                lat, lng = _extract_coords(user_text)
+                lat, lng = await loop.run_in_executor(None, _extract_coords, user_text)
 
-                # URLがなければ地名をジオコード
+                # URLから取れなければ地名・駅名をジオコード
                 if lat is None:
-                    place_match = re.search(r'([一-鿿぀-ヿ\w]+駅|[一-鿿]{2,})', user_text)
+                    place_match = re.search(
+                        r'([ぁ-んァ-ヶー一-鿿]{1,10}[駅町市区村丁目]+|[ぁ-んァ-ヶー一-鿿]{2,8}(?:周辺|付近|エリア)?)',
+                        re.sub(r'近く|付近|周辺|現在地|営業中|今開いてる|バー|居酒屋|レストラン|カフェ|検索|探して', '', user_text)
+                    )
                     if place_match:
                         lat, lng = await loop.run_in_executor(None, _geocode, place_match.group(1))
+                        print(f"ジオコード: {place_match.group(1)} → {lat},{lng}")
 
                 if lat is None:
-                    await message.reply(f"{BOT_PREFIX}📍 現在地のGoogle MapsリンクをコピーしてDiscordに貼り付けてください。\n例：https://maps.google.com/?q=35.6762,139.6503")
+                    await message.reply(
+                        f"{BOT_PREFIX}📍 場所を特定できませんでした。以下のいずれかの方法で教えてください：\n\n"
+                        f"① Google Mapsで現在地を長押し → 「共有」→ リンクを貼る\n"
+                        f"② 駅名や地名を入れる（例：「渋谷駅近くの営業中のバー」）"
+                    )
                     return
 
                 # 検索キーワード抽出（バー・レストラン・コンビニ等）
