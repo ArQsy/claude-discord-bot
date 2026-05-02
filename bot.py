@@ -22,7 +22,8 @@ ANTHROPIC_API_KEY = os.environ['ANTHROPIC_API_KEY']
 DATABASE_URL = os.environ['DATABASE_URL']
 GOOGLE_MAPS_API_KEY = os.environ.get('GOOGLE_MAPS_API_KEY', '')
 PORT = int(os.environ.get('PORT', 8080))
-BOT_BASE_URL = os.environ.get('BOT_BASE_URL', '')  # 例: https://xxx.up.railway.app
+_raw_base_url = os.environ.get('BOT_BASE_URL', '')
+BOT_BASE_URL = f"https://{_raw_base_url}" if _raw_base_url and not _raw_base_url.startswith('http') else _raw_base_url
 
 # 位置情報リクエストの一時保存 {token: (channel_id, keyword, radius, open_now, expires_at)}
 _pending_locations: dict[str, tuple] = {}
