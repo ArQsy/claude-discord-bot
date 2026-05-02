@@ -32,6 +32,27 @@ BOT_PREFIX = "**【アシスタント】**\n"
 REMINDER_KEYWORDS = ["リマインド", "reminder", "通知して", "忘れないように", "教えて", "アラーム"]
 MEMO_SAVE_KEYWORDS = ["メモして", "メモ：", "メモ:", "覚えておいて", "記録して", "メモ保存"]
 MEMO_LIST_KEYWORDS = ["メモ見せて", "メモ一覧", "メモを教えて", "メモ確認", "メモリスト"]
+RESERVATION_KEYWORDS = ["予約", "席を取って", "予約して", "予約したい", "ご予約", "席の予約"]
+
+RESERVATION_SYSTEM_PROMPT = """あなたはレストラン予約のアシスタントです。
+ユーザーのメッセージから予約情報を整理し、予約ページを探して案内してください。
+
+以下の形式で回答してください：
+
+**🍽️ 予約情報まとめ**
+- お店：〇〇
+- 日時：〇月〇日 〇時
+- 人数：〇名
+- 名前：（未指定の場合は「要確認」）
+
+**🔗 予約ページ**
+（ぐるなび・食べログ・ホットペッパー等で見つけた予約URLを貼る）
+
+**📋 入力内容**
+予約フォームに入力する内容を箇条書きで整理する
+
+予約ページが見つからない場合は「公式サイト」「電話番号」を案内してください。
+ウェブ検索を積極的に使って最新の予約ページURLを見つけてください。"""
 
 
 # ───────────── DB ─────────────
@@ -161,11 +182,12 @@ def _get_memos(channel_id, limit=10):
 # ───────────── インテント判定 ─────────────
 
 def _detect_intent(text):
-    t = text.lower()
     if any(k in text for k in MEMO_LIST_KEYWORDS):
         return "memo_list"
     if any(k in text for k in MEMO_SAVE_KEYWORDS):
         return "memo_save"
+    if any(k in text for k in RESERVATION_KEYWORDS):
+        return "reservation"
     if any(k in text for k in REMINDER_KEYWORDS):
         return "reminder"
     return "chat"
@@ -359,6 +381,25 @@ async def on_message(message):
                 except Exception as e:
                     print(f"リマインダー設定エラー: {e}")
                     await message.reply(f"{BOT_PREFIX}リマインダーの設定に失敗しました。日時をもう少し具体的に教えてください。")
+                return
+
+            # ── 予約サポート ──
+            if intent == "reservation":
+                response = anthropic_client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=2048,
+                    system=RESERVATION_SYSTEM_PROMPT,
+                    tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
+                    messages=[{"role": "user", "content": user_text}],
+                )
+                reply_text = ""
+                for block in response.content:
+                    if hasattr(block, 'text'):
+                        reply_text += block.text
+                if not reply_text:
+                    reply_text = "予約ページの検索に失敗しました。お店名と日時をもう少し詳しく教えてください。"
+                for chunk in split_message(BOT_PREFIX + reply_text):
+                    await message.reply(chunk)
                 return
 
             # ── 通常チャット ──
