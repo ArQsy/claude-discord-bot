@@ -382,24 +382,32 @@ def _transcribe_sync(audio_bytes, suffix='.ogg'):
 
 
 def _transcribe_aquavoice(audio_bytes, suffix='.ogg'):
-    tmp_path = None
+    tmp_src = tmp_wav = None
     try:
+        # 元ファイルを保存
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
             f.write(audio_bytes)
-            tmp_path = f.name
-        with open(tmp_path, 'rb') as f:
+            tmp_src = f.name
+
+        # WAVに変換（AquaVoiceはogg/opusを直接受け付けない場合がある）
+        tmp_wav = tmp_src.replace(suffix, '.wav')
+        AudioSegment.from_file(tmp_src).export(tmp_wav, format='wav')
+
+        with open(tmp_wav, 'rb') as f:
             resp = requests.post(
                 'https://api.aquavoice.com/api/v1/audio/transcriptions',
                 headers={'Authorization': f'Bearer {AQUAVOICE_API_KEY}'},
-                files={'file': (f'audio{suffix}', f)},
+                files={'file': ('audio.wav', f, 'audio/wav')},
                 data={'model': 'avalon-v1.5'},
                 timeout=30,
             )
+        print(f"AquaVoice応答: {resp.status_code} {resp.text[:200]}")
         resp.raise_for_status()
         return resp.json().get('text', '')
     finally:
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        for p in [tmp_src, tmp_wav]:
+            if p and os.path.exists(p):
+                os.unlink(p)
 
 
 def split_message(text, limit=2000):
