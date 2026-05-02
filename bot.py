@@ -1,9 +1,12 @@
 import os
 import asyncio
+import tempfile
 import discord
 import anthropic
 import psycopg2
 import psycopg2.extras
+import speech_recognition as sr
+from pydub import AudioSegment
 
 DISCORD_BOT_TOKEN = os.environ['DISCORD_BOT_TOKEN']
 ANTHROPIC_API_KEY = os.environ['ANTHROPIC_API_KEY']
@@ -18,7 +21,8 @@ SYSTEM_PROMPT = """あなたは優秀なパーソナルアシスタントです�
 ウェブ検索が必要な場合は検索ツールを使って最新情報を取得してください。
 コードの作業、情報収集、調査、雑談など何でも対応します。"""
 
-HISTORY_LIMIT = 40  # 直近何件をコンテキストに使うか
+HISTORY_LIMIT = 40
+BOT_PREFIX = "**【アシスタント】**\n"
 
 
 def _get_conn():
@@ -71,6 +75,28 @@ def _save_messages(channel_id, user_text, reply_text):
         conn.commit()
 
 
+def _transcribe_sync(audio_bytes, suffix='.ogg'):
+    tmp_ogg = None
+    tmp_wav = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+            f.write(audio_bytes)
+            tmp_ogg = f.name
+
+        tmp_wav = tmp_ogg.replace(suffix, '.wav')
+        audio = AudioSegment.from_file(tmp_ogg)
+        audio.export(tmp_wav, format='wav')
+
+        r = sr.Recognizer()
+        with sr.AudioFile(tmp_wav) as source:
+            audio_data = r.record(source)
+        return r.recognize_google(audio_data, language='ja-JP')
+    finally:
+        for path in [tmp_ogg, tmp_wav]:
+            if path and os.path.exists(path):
+                os.unlink(path)
+
+
 def split_message(text, limit=2000):
     if len(text) <= limit:
         return [text]
@@ -101,24 +127,40 @@ async def on_message(message):
 
     is_dm = isinstance(message.channel, discord.DMChannel)
     is_mentioned = discord_client.user in message.mentions
-    if not (is_dm or is_mentioned):
+    has_audio = any(a.content_type and a.content_type.startswith('audio/') for a in message.attachments)
+
+    if not (is_dm or is_mentioned or has_audio):
         return
 
     channel_id = str(message.channel.id)
-
-    user_text = message.content
-    for mention in message.mentions:
-        user_text = user_text.replace(f'<@{mention.id}>', '').replace(f'<@!{mention.id}>', '')
-    user_text = user_text.strip()
-
-    if not user_text:
-        return
+    loop = asyncio.get_event_loop()
 
     async with message.channel.typing():
         try:
-            loop = asyncio.get_event_loop()
+            # ボイスメッセージの文字起こし
+            user_text = message.content
+            for mention in message.mentions:
+                user_text = user_text.replace(f'<@{mention.id}>', '').replace(f'<@!{mention.id}>', '')
+            user_text = user_text.strip()
 
-            # DBから会話履歴を取得
+            audio_attachment = next(
+                (a for a in message.attachments if a.content_type and a.content_type.startswith('audio/')),
+                None
+            )
+            if audio_attachment:
+                audio_bytes = await audio_attachment.read()
+                suffix = '.ogg' if 'ogg' in (audio_attachment.content_type or '') else '.wav'
+                try:
+                    transcribed = await loop.run_in_executor(None, _transcribe_sync, audio_bytes, suffix)
+                    user_text = f"[ボイスメッセージ] {transcribed}" if not user_text else f"{user_text}\n[ボイスメッセージ] {transcribed}"
+                except Exception as e:
+                    print(f"文字起こし失敗: {e}")
+                    await message.reply(f"{BOT_PREFIX}ボイスメッセージの文字起こしに失敗しました。")
+                    return
+
+            if not user_text:
+                return
+
             history = await loop.run_in_executor(None, _load_history, channel_id)
             history.append({"role": "user", "content": user_text})
 
@@ -138,15 +180,15 @@ async def on_message(message):
             if not reply_text:
                 reply_text = "（応答を生成できませんでした）"
 
-            # DBに保存
             await loop.run_in_executor(None, _save_messages, channel_id, user_text, reply_text)
 
-            for chunk in split_message(reply_text):
+            full_reply = BOT_PREFIX + reply_text
+            for chunk in split_message(full_reply):
                 await message.reply(chunk)
 
         except Exception as e:
             print(f"エラー: {e}")
-            await message.reply(f"エラーが発生しました: {str(e)[:200]}")
+            await message.reply(f"{BOT_PREFIX}エラーが発生しました: {str(e)[:200]}")
 
 
 discord_client.run(DISCORD_BOT_TOKEN)
