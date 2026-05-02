@@ -308,22 +308,67 @@ def _geocode(address):
     return None, None
 
 
-def _nearby_search(lat, lng, keyword, radius=1000, open_now=True):
+PLACE_TYPE_MAP = {
+    'コンビニ': 'convenience_store',
+    'レストラン': 'restaurant',
+    '居酒屋': 'bar',
+    'バー': 'bar',
+    'カフェ': 'cafe',
+    'スーパー': 'supermarket',
+    '薬局': 'pharmacy',
+    'ドラッグストア': 'pharmacy',
+    'ドラスト': 'pharmacy',
+    'ホテル': 'lodging',
+    'ガソリンスタンド': 'gas_station',
+    '駐車場': 'parking',
+    '銭湯': 'spa',
+    'カラオケ': 'karaoke',
+    'ラーメン': 'restaurant',
+    '寿司': 'restaurant',
+    '焼肉': 'restaurant',
+    'マック': 'meal_takeaway',
+    'マクドナルド': 'meal_takeaway',
+    'スタバ': 'cafe',
+}
+
+
+def _nearby_search(lat, lng, keyword, radius=2000, open_now=False):
     """Places API で周辺スポットを検索"""
     params = {
         "location": f"{lat},{lng}",
         "radius": radius,
-        "keyword": keyword,
         "language": "ja",
         "key": GOOGLE_MAPS_API_KEY,
     }
+    # 日本語キーワードをAPIタイプに変換できる場合はtypeを使う
+    place_type = PLACE_TYPE_MAP.get(keyword)
+    if place_type:
+        params["type"] = place_type
+    else:
+        params["keyword"] = keyword
+
     if open_now:
         params["opennow"] = "true"
+
     r = requests.get(
         "https://maps.googleapis.com/maps/api/place/nearbysearch/json",
         params=params, timeout=10
     )
-    return r.json().get("results", [])
+    results = r.json().get("results", [])
+    print(f"Places API: {len(results)}件 (type={place_type}, keyword={keyword}, radius={radius})")
+
+    # 結果が少なければ半径を広げて再試行
+    if len(results) < 3 and radius < 5000:
+        params["radius"] = 5000
+        params.pop("opennow", None)
+        r2 = requests.get(
+            "https://maps.googleapis.com/maps/api/place/nearbysearch/json",
+            params=params, timeout=10
+        )
+        results = r2.json().get("results", []) or results
+        print(f"Places API (拡大): {len(results)}件")
+
+    return results
 
 
 def _haversine(lat1, lng1, lat2, lng2):
