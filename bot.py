@@ -150,6 +150,17 @@ def _load_history(channel_id):
     return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
 
+def _prune_old_conversations(days=90):
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM discord_conversations WHERE created_at < %s",
+                (cutoff,)
+            )
+        conn.commit()
+
+
 def _save_messages(channel_id, user_text, reply_text):
     with _get_conn() as conn:
         with conn.cursor() as cur:
@@ -335,34 +346,43 @@ PLACE_TYPE_MAP = {
 def _nearby_search(lat, lng, keyword, radius=2000, open_now=False):
     """Places API (New) で周辺スポットを検索"""
     place_type = PLACE_TYPE_MAP.get(keyword)
+    field_mask = "places.id,places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.location,places.regularOpeningHours"
 
     def _search(r):
-        body = {
-            "locationRestriction": {
-                "circle": {
-                    "center": {"latitude": lat, "longitude": lng},
-                    "radius": float(r)
-                }
-            },
-            "maxResultCount": 20,
-            "languageCode": "ja",
-        }
         if place_type:
-            body["includedTypes"] = [place_type]
+            # searchNearby: タイプ指定の近隣検索
+            body = {
+                "locationRestriction": {
+                    "circle": {"center": {"latitude": lat, "longitude": lng}, "radius": float(r)}
+                },
+                "includedTypes": [place_type],
+                "maxResultCount": 20,
+                "languageCode": "ja",
+            }
+            endpoint = "https://places.googleapis.com/v1/places:searchNearby"
         else:
-            body["textQuery"] = keyword  # テキスト検索にフォールバック
+            # searchText: キーワード検索（searchNearbyはtextQueryを非対応）
+            body = {
+                "textQuery": keyword,
+                "locationBias": {
+                    "circle": {"center": {"latitude": lat, "longitude": lng}, "radius": float(r)}
+                },
+                "maxResultCount": 20,
+                "languageCode": "ja",
+            }
+            endpoint = "https://places.googleapis.com/v1/places:searchText"
 
         resp = requests.post(
-            "https://places.googleapis.com/v1/places:searchNearby",
+            endpoint,
             headers={
                 "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
-                "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.location,places.regularOpeningHours",
+                "X-Goog-FieldMask": field_mask,
                 "Content-Type": "application/json",
             },
             json=body,
             timeout=15,
         )
-        print(f"Places API (New): {resp.status_code} radius={r} type={place_type} keyword={keyword}")
+        print(f"Places API: {resp.status_code} radius={r} type={place_type} keyword={keyword}")
         if resp.status_code != 200:
             print(f"  エラー詳細: {resp.text[:300]}")
             return []
@@ -370,7 +390,9 @@ def _nearby_search(lat, lng, keyword, radius=2000, open_now=False):
 
     results = _search(radius)
     if len(results) < 3:
-        results = _search(5000) or results
+        wider = _search(5000) or []
+        seen = {p.get('id') for p in results}
+        results = results + [p for p in wider if p.get('id') not in seen]
     return results
 
 
@@ -393,7 +415,7 @@ def _format_places(places, lat, lng, limit=8):
         user_ratings = p.get("userRatingCount", 0)
         address = p.get("formattedAddress", "")
         place_id = p.get("id", "")
-        loc = p.get("location", {})
+        loc = p.get("location") or {}
         dist = int(_haversine(lat, lng, loc.get("latitude", lat), loc.get("longitude", lng)))
         maps_url = f"https://www.google.com/maps/place/?q=place_id:{place_id}"
         open_now = p.get("regularOpeningHours", {}).get("openNow")
@@ -608,6 +630,7 @@ def _cleanup_pending_locations():
 
 async def reminder_checker():
     await discord_client.wait_until_ready()
+    _tick = 0
     while not discord_client.is_closed():
         try:
             loop = asyncio.get_running_loop()
@@ -625,6 +648,11 @@ async def reminder_checker():
                 await loop.run_in_executor(None, _mark_fired, r['id'])
             # 期限切れ位置情報トークンを定期削除
             _cleanup_pending_locations()
+            # 1日1回、90日以上前の会話履歴を削除
+            _tick += 1
+            if _tick % 1440 == 0:
+                await loop.run_in_executor(None, _prune_old_conversations)
+                print("会話履歴pruning完了（90日以上前を削除）")
         except Exception as e:
             print(f"リマインダーチェックエラー: {e}")
         await asyncio.sleep(60)
