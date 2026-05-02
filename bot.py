@@ -696,9 +696,16 @@ async def on_message(message):
 
                     if BOT_BASE_URL:
                         link = f"{BOT_BASE_URL}/location?token={token}"
+                        view = discord.ui.View()
+                        view.add_item(discord.ui.Button(
+                            label="📍 現在地を共有する",
+                            url=link,
+                            style=discord.ButtonStyle.link
+                        ))
                         await message.reply(
-                            f"{BOT_PREFIX}📍 こちらのリンクをスマホで開いて「現在地を共有する」を押してください：\n{link}\n\n"
-                            f"🔍 検索条件：**{keyword}** / 半径{radius}m{'（営業中のみ）' if open_now else ''}"
+                            f"{BOT_PREFIX}🔍 **{keyword}** / 半径{radius}m{'（営業中のみ）' if open_now else ''}\n"
+                            f"下のボタンをタップして現在地を送信してください。",
+                            view=view
                         )
                     else:
                         await message.reply(
