@@ -2,6 +2,7 @@ import os
 import re
 import json
 import math
+import uuid
 import asyncio
 import base64
 import tempfile
@@ -11,6 +12,7 @@ import anthropic
 import psycopg2
 import psycopg2.extras
 import requests
+from aiohttp import web
 import speech_recognition as sr
 from pydub import AudioSegment
 
@@ -18,6 +20,11 @@ DISCORD_BOT_TOKEN = os.environ['DISCORD_BOT_TOKEN']
 ANTHROPIC_API_KEY = os.environ['ANTHROPIC_API_KEY']
 DATABASE_URL = os.environ['DATABASE_URL']
 GOOGLE_MAPS_API_KEY = os.environ.get('GOOGLE_MAPS_API_KEY', '')
+PORT = int(os.environ.get('PORT', 8080))
+BOT_BASE_URL = os.environ.get('BOT_BASE_URL', '')  # 例: https://xxx.up.railway.app
+
+# 位置情報リクエストの一時保存 {token: (channel_id, keyword, radius, open_now)}
+_pending_locations = {}
 
 JST = timezone(timedelta(hours=9))
 
@@ -379,6 +386,120 @@ def split_message(text, limit=2000):
 
 # ───────────── バックグラウンド: リマインダーチェック ─────────────
 
+# ───────────── Webサーバー（位置情報共有用） ─────────────
+
+LOCATION_HTML = """<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>現在地を共有</title>
+<style>
+  body { font-family: -apple-system, sans-serif; display: flex; flex-direction: column;
+         align-items: center; justify-content: center; min-height: 100vh; margin: 0;
+         background: #1a1a2e; color: #fff; text-align: center; padding: 20px; }
+  h2 { margin-bottom: 8px; }
+  p { color: #aaa; margin-bottom: 32px; }
+  button { background: #5865F2; color: white; border: none; border-radius: 12px;
+           padding: 16px 32px; font-size: 18px; cursor: pointer; }
+  button:disabled { background: #444; }
+  #status { margin-top: 24px; color: #aaa; }
+</style>
+</head>
+<body>
+<h2>📍 現在地を共有</h2>
+<p>ボタンを押して位置情報を許可してください</p>
+<button id="btn" onclick="share()">現在地を共有する</button>
+<div id="status"></div>
+<script>
+async function share() {
+  const btn = document.getElementById('btn');
+  const status = document.getElementById('status');
+  btn.disabled = true;
+  status.textContent = '取得中...';
+  try {
+    const pos = await new Promise((resolve, reject) =>
+      navigator.geolocation.getCurrentPosition(resolve, reject, {enableHighAccuracy: true})
+    );
+    const res = await fetch('/location/submit', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        lat: pos.coords.latitude,
+        lng: pos.coords.longitude,
+        token: new URLSearchParams(location.search).get('token')
+      })
+    });
+    if (res.ok) {
+      status.textContent = '';
+      document.querySelector('p').textContent = '';
+      btn.textContent = '✅ 送信完了！';
+      document.querySelector('h2').textContent = 'Discordに結果が届きます';
+    } else {
+      status.textContent = 'エラーが発生しました';
+      btn.disabled = false;
+    }
+  } catch(e) {
+    status.textContent = '位置情報の取得に失敗しました: ' + e.message;
+    btn.disabled = false;
+  }
+}
+</script>
+</body>
+</html>"""
+
+
+async def handle_location_page(request):
+    return web.Response(text=LOCATION_HTML, content_type='text/html')
+
+
+async def handle_location_submit(request):
+    try:
+        data = await request.json()
+        token = data.get('token', '')
+        lat = float(data.get('lat', 0))
+        lng = float(data.get('lng', 0))
+
+        if token not in _pending_locations:
+            return web.Response(status=400, text='Invalid token')
+
+        channel_id, keyword, radius, open_now = _pending_locations.pop(token)
+        channel = discord_client.get_channel(int(channel_id))
+        if not channel:
+            return web.Response(status=400, text='Channel not found')
+
+        places = _nearby_search(lat, lng, keyword, radius, open_now)
+        if not places:
+            await channel.send(f"{BOT_PREFIX}半径{radius}m以内に「{keyword}」は見つかりませんでした。")
+        else:
+            open_label = "（営業中のみ）" if open_now else ""
+            header = f"📍 現在地から半径{radius}m以内の**{keyword}**{open_label}\n\n"
+            body = _format_places(places, lat, lng)
+            for chunk in split_message(BOT_PREFIX + header + body):
+                await channel.send(chunk)
+
+        return web.Response(text='OK')
+    except Exception as e:
+        print(f"位置情報受信エラー: {e}")
+        return web.Response(status=500, text=str(e))
+
+
+async def handle_health(request):
+    return web.Response(text='OK')
+
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle_health)
+    app.router.add_get('/location', handle_location_page)
+    app.router.add_post('/location/submit', handle_location_submit)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    print(f'Webサーバー起動: port {PORT}')
+
+
 async def reminder_checker():
     await discord_client.wait_until_ready()
     while not discord_client.is_closed():
@@ -408,6 +529,7 @@ async def on_ready():
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _init_db)
     discord_client.loop.create_task(reminder_checker())
+    discord_client.loop.create_task(start_web_server())
     print(f'Bot起動: {discord_client.user}')
 
 
@@ -530,17 +652,29 @@ async def on_message(message):
                     )
                     if place_match:
                         lat, lng = await loop.run_in_executor(None, _geocode, place_match.group(1))
-                        print(f"ジオコード: {place_match.group(1)} → {lat},{lng}")
 
+                # 現在地リンク方式（GPS）
                 if lat is None:
-                    await message.reply(
-                        f"{BOT_PREFIX}📍 場所を特定できませんでした。以下のいずれかで教えてください：\n\n"
-                        f"**① 座標を貼る（一番確実）**\n"
-                        f"Google Maps → 現在地を長押し → 画面下に出る数字をタップ → コピー → 貼り付け\n"
-                        f"例：`35.6762, 139.6503`\n\n"
-                        f"**② 駅名・地名で指定**\n"
-                        f"例：「渋谷駅近くの今開いてるバー」"
-                    )
+                    keyword_match = re.search(r'(バー|居酒屋|レストラン|カフェ|コンビニ|薬局|スーパー|ラーメン|寿司|焼肉|ホテル|銭湯|[一-鿿]{1,6})', user_text)
+                    keyword = keyword_match.group(1) if keyword_match else "飲食店"
+                    open_now = any(k in user_text for k in ["営業中", "今開いてる", "今やってる", "開いてる"])
+                    radius_match = re.search(r'(\d+)\s*km', user_text)
+                    radius = int(float(radius_match.group(1)) * 1000) if radius_match else 1000
+
+                    token = str(uuid.uuid4())[:8]
+                    _pending_locations[token] = (channel_id, keyword, radius, open_now)
+
+                    if BOT_BASE_URL:
+                        link = f"{BOT_BASE_URL}/location?token={token}"
+                        await message.reply(
+                            f"{BOT_PREFIX}📍 こちらのリンクをスマホで開いて「現在地を共有する」を押してください：\n{link}\n\n"
+                            f"🔍 検索条件：**{keyword}** / 半径{radius}m{'（営業中のみ）' if open_now else ''}"
+                        )
+                    else:
+                        await message.reply(
+                            f"{BOT_PREFIX}📍 場所を特定できませんでした。駅名・地名で指定してください。\n"
+                            f"例：「渋谷駅近くの今開いてるバー」"
+                        )
                     return
 
                 # 検索キーワード抽出（バー・レストラン・コンビニ等）
