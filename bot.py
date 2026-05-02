@@ -1,5 +1,7 @@
 import os
+import re
 import json
+import math
 import asyncio
 import base64
 import tempfile
@@ -8,12 +10,14 @@ import discord
 import anthropic
 import psycopg2
 import psycopg2.extras
+import requests
 import speech_recognition as sr
 from pydub import AudioSegment
 
 DISCORD_BOT_TOKEN = os.environ['DISCORD_BOT_TOKEN']
 ANTHROPIC_API_KEY = os.environ['ANTHROPIC_API_KEY']
 DATABASE_URL = os.environ['DATABASE_URL']
+GOOGLE_MAPS_API_KEY = os.environ.get('GOOGLE_MAPS_API_KEY', '')
 
 JST = timezone(timedelta(hours=9))
 
@@ -34,6 +38,7 @@ MEMO_SAVE_KEYWORDS = ["メモして", "メモ：", "メモ:", "覚えておい�
 MEMO_LIST_KEYWORDS = ["メモ見せて", "メモ一覧", "メモを教えて", "メモ確認", "メモリスト"]
 RESERVATION_KEYWORDS = ["予約", "席を取って", "予約して", "予約したい", "ご予約", "席の予約"]
 TRAVEL_KEYWORDS = ["航空券", "飛行機", "ホテル", "宿", "ツアー", "旅行", "格安", "安いフライト", "旅館", "パック旅行", "ANA", "JAL", "LCC"]
+MAP_KEYWORDS = ["近く", "現在地", "付近", "周辺", "近い", "近くの", "今開いてる", "営業中", "地図", "マップ"]
 
 TRAVEL_SYSTEM_PROMPT = """あなたは旅行・交通のお得情報を探すアシスタントです。
 ユーザーの条件（出発地・目的地・日程・人数・予算）を整理し、ウェブ検索で最安値に近い選択肢を見つけてください。
@@ -205,6 +210,8 @@ def _detect_intent(text):
         return "memo_list"
     if any(k in text for k in MEMO_SAVE_KEYWORDS):
         return "memo_save"
+    if any(k in text for k in MAP_KEYWORDS) and ('maps.google' in text or 'goo.gl' in text or 'maps.app' in text or any(k in text for k in ["近くの", "付近の", "周辺の"])):
+        return "map_search"
     if any(k in text for k in TRAVEL_KEYWORDS):
         return "travel"
     if any(k in text for k in RESERVATION_KEYWORDS):
@@ -232,6 +239,96 @@ def _parse_reminder(text):
 
 
 # ───────────── ユーティリティ ─────────────
+
+def _extract_coords(text):
+    """テキスト中のGoogle Maps URLから座標を抽出"""
+    patterns = [
+        r'[?&]q=(-?\d+\.\d+),(-?\d+\.\d+)',
+        r'/@(-?\d+\.\d+),(-?\d+\.\d+)',
+        r'll=(-?\d+\.\d+),(-?\d+\.\d+)',
+        r'!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)',
+    ]
+    urls = re.findall(r'https?://[^\s]+', text)
+    for url in urls:
+        # 短縮URLはリダイレクト先を取得
+        if 'goo.gl' in url or 'maps.app' in url:
+            try:
+                r = requests.get(url, allow_redirects=True, timeout=5)
+                url = r.url
+            except Exception:
+                pass
+        for pat in patterns:
+            m = re.search(pat, url)
+            if m:
+                return float(m.group(1)), float(m.group(2))
+    return None, None
+
+
+def _geocode(address):
+    """住所・地名を座標に変換"""
+    if not GOOGLE_MAPS_API_KEY:
+        return None, None
+    r = requests.get(
+        "https://maps.googleapis.com/maps/api/geocode/json",
+        params={"address": address, "language": "ja", "key": GOOGLE_MAPS_API_KEY},
+        timeout=10
+    )
+    data = r.json()
+    if data.get("results"):
+        loc = data["results"][0]["geometry"]["location"]
+        return loc["lat"], loc["lng"]
+    return None, None
+
+
+def _nearby_search(lat, lng, keyword, radius=1000, open_now=True):
+    """Places API で周辺スポットを検索"""
+    params = {
+        "location": f"{lat},{lng}",
+        "radius": radius,
+        "keyword": keyword,
+        "language": "ja",
+        "key": GOOGLE_MAPS_API_KEY,
+    }
+    if open_now:
+        params["opennow"] = "true"
+    r = requests.get(
+        "https://maps.googleapis.com/maps/api/place/nearbysearch/json",
+        params=params, timeout=10
+    )
+    return r.json().get("results", [])
+
+
+def _haversine(lat1, lng1, lat2, lng2):
+    """2点間の距離(m)を計算"""
+    R = 6371000
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lng2 - lng1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+
+
+def _format_places(places, lat, lng, limit=8):
+    """検索結果を整形"""
+    lines = []
+    for i, p in enumerate(places[:limit], 1):
+        name = p.get("name", "不明")
+        rating = p.get("rating", "-")
+        user_ratings = p.get("user_ratings_total", 0)
+        vicinity = p.get("vicinity", "")
+        place_id = p.get("place_id", "")
+        loc = p.get("geometry", {}).get("location", {})
+        dist = int(_haversine(lat, lng, loc.get("lat", lat), loc.get("lng", lng)))
+        maps_url = f"https://www.google.com/maps/place/?q=place_id:{place_id}"
+        open_now = p.get("opening_hours", {}).get("open_now")
+        status = "🟢 営業中" if open_now else ("🔴 営業時間外" if open_now is False else "")
+        lines.append(
+            f"**{i}. {name}** ⭐{rating}（{user_ratings}件）{' ' + status if status else ''}\n"
+            f"　📍 {vicinity}（約{dist}m）\n"
+            f"　🔗 {maps_url}"
+        )
+    return "\n\n".join(lines)
+
 
 def _transcribe_sync(audio_bytes, suffix='.ogg'):
     tmp_ogg = tmp_wav = None
@@ -402,6 +499,44 @@ async def on_message(message):
                 except Exception as e:
                     print(f"リマインダー設定エラー: {e}")
                     await message.reply(f"{BOT_PREFIX}リマインダーの設定に失敗しました。日時をもう少し具体的に教えてください。")
+                return
+
+            # ── 地図・周辺検索 ──
+            if intent == "map_search":
+                if not GOOGLE_MAPS_API_KEY:
+                    await message.reply(f"{BOT_PREFIX}Google Maps APIキーが設定されていません。")
+                    return
+
+                lat, lng = _extract_coords(user_text)
+
+                # URLがなければ地名をジオコード
+                if lat is None:
+                    place_match = re.search(r'([一-鿿぀-ヿ\w]+駅|[一-鿿]{2,})', user_text)
+                    if place_match:
+                        lat, lng = await loop.run_in_executor(None, _geocode, place_match.group(1))
+
+                if lat is None:
+                    await message.reply(f"{BOT_PREFIX}📍 現在地のGoogle MapsリンクをコピーしてDiscordに貼り付けてください。\n例：https://maps.google.com/?q=35.6762,139.6503")
+                    return
+
+                # 検索キーワード抽出（バー・レストラン・コンビニ等）
+                keyword_match = re.search(r'(バー|居酒屋|レストラン|カフェ|コンビニ|薬局|スーパー|ラーメン|寿司|焼肉|ホテル|銭湯|[一-鿿]{1,6})', user_text)
+                keyword = keyword_match.group(1) if keyword_match else "飲食店"
+                open_now = any(k in user_text for k in ["営業中", "今開いてる", "今やってる", "開いてる"])
+
+                radius_match = re.search(r'(\d+)\s*km', user_text)
+                radius = int(float(radius_match.group(1)) * 1000) if radius_match else 1000
+
+                places = await loop.run_in_executor(None, _nearby_search, lat, lng, keyword, radius, open_now)
+                if not places:
+                    await message.reply(f"{BOT_PREFIX}半径{radius}m以内に「{keyword}」は見つかりませんでした。範囲を広げるか別のキーワードをお試しください。")
+                    return
+
+                body = _format_places(places, lat, lng)
+                open_label = "（営業中のみ）" if open_now else ""
+                header = f"📍 現在地から半径{radius}m以内の**{keyword}**{open_label}\n\n"
+                for chunk in split_message(BOT_PREFIX + header + body):
+                    await message.reply(chunk)
                 return
 
             # ── 旅行検索 ──
