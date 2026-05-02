@@ -3,3 +3,4 @@ anthropic>=0.50.0
 psycopg2-binary>=2.9.0
 SpeechRecognition>=3.10.0
 pydub>=0.25.1
+requests>=2.31.0
