@@ -1,7 +1,9 @@
 import os
+import json
 import asyncio
 import base64
 import tempfile
+from datetime import datetime, timezone, timedelta
 import discord
 import anthropic
 import psycopg2
@@ -12,6 +14,8 @@ from pydub import AudioSegment
 DISCORD_BOT_TOKEN = os.environ['DISCORD_BOT_TOKEN']
 ANTHROPIC_API_KEY = os.environ['ANTHROPIC_API_KEY']
 DATABASE_URL = os.environ['DATABASE_URL']
+
+JST = timezone(timedelta(hours=9))
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -25,6 +29,12 @@ SYSTEM_PROMPT = """あなたは優秀なパーソナルアシスタントです�
 HISTORY_LIMIT = 40
 BOT_PREFIX = "**【アシスタント】**\n"
 
+REMINDER_KEYWORDS = ["リマインド", "reminder", "通知して", "忘れないように", "教えて", "アラーム"]
+MEMO_SAVE_KEYWORDS = ["メモして", "メモ：", "メモ:", "覚えておいて", "記録して", "メモ保存"]
+MEMO_LIST_KEYWORDS = ["メモ見せて", "メモ一覧", "メモを教えて", "メモ確認", "メモリスト"]
+
+
+# ───────────── DB ─────────────
 
 def _get_conn():
     return psycopg2.connect(DATABASE_URL)
@@ -45,6 +55,28 @@ def _init_db():
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_discord_conv_channel
                 ON discord_conversations(channel_id, created_at)
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS reminders (
+                    id SERIAL PRIMARY KEY,
+                    channel_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    username TEXT,
+                    message TEXT NOT NULL,
+                    remind_at TIMESTAMP NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    fired BOOLEAN DEFAULT FALSE
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS memos (
+                    id SERIAL PRIMARY KEY,
+                    channel_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    username TEXT,
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
             """)
         conn.commit()
 
@@ -76,26 +108,104 @@ def _save_messages(channel_id, user_text, reply_text):
         conn.commit()
 
 
+def _save_reminder(channel_id, user_id, username, message, remind_at):
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO reminders (channel_id, user_id, username, message, remind_at) VALUES (%s, %s, %s, %s, %s)",
+                (channel_id, user_id, username, message, remind_at)
+            )
+        conn.commit()
+
+
+def _get_due_reminders():
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute("""
+                SELECT * FROM reminders
+                WHERE fired = FALSE AND remind_at <= %s
+            """, (now_utc,))
+            return cur.fetchall()
+
+
+def _mark_fired(reminder_id):
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE reminders SET fired = TRUE WHERE id = %s", (reminder_id,))
+        conn.commit()
+
+
+def _save_memo(channel_id, user_id, username, content):
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO memos (channel_id, user_id, username, content) VALUES (%s, %s, %s, %s)",
+                (channel_id, user_id, username, content)
+            )
+        conn.commit()
+
+
+def _get_memos(channel_id, limit=10):
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute("""
+                SELECT content, created_at FROM memos
+                WHERE channel_id = %s
+                ORDER BY created_at DESC
+                LIMIT %s
+            """, (channel_id, limit))
+            return cur.fetchall()
+
+
+# ───────────── インテント判定 ─────────────
+
+def _detect_intent(text):
+    t = text.lower()
+    if any(k in text for k in MEMO_LIST_KEYWORDS):
+        return "memo_list"
+    if any(k in text for k in MEMO_SAVE_KEYWORDS):
+        return "memo_save"
+    if any(k in text for k in REMINDER_KEYWORDS):
+        return "reminder"
+    return "chat"
+
+
+def _parse_reminder(text):
+    """Claudeで日時とメッセージを抽出（Haiku使用でコスト節約）"""
+    now_jst = datetime.now(JST).strftime("%Y年%m月%d日 %H:%M")
+    response = anthropic_client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=200,
+        system=f"""現在の日時（JST）: {now_jst}
+ユーザーのメッセージからリマインダーの日時と内容を抽出してください。
+必ずJSON形式のみで返してください（説明文は不要）:
+{{"remind_at": "YYYY-MM-DDTHH:MM:SS", "message": "リマインダー内容"}}
+日時が不明な場合: {{"error": "日時が不明です"}}""",
+        messages=[{"role": "user", "content": text}]
+    )
+    raw = response.content[0].text.strip()
+    return json.loads(raw)
+
+
+# ───────────── ユーティリティ ─────────────
+
 def _transcribe_sync(audio_bytes, suffix='.ogg'):
-    tmp_ogg = None
-    tmp_wav = None
+    tmp_ogg = tmp_wav = None
     try:
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
             f.write(audio_bytes)
             tmp_ogg = f.name
-
         tmp_wav = tmp_ogg.replace(suffix, '.wav')
-        audio = AudioSegment.from_file(tmp_ogg)
-        audio.export(tmp_wav, format='wav')
-
+        AudioSegment.from_file(tmp_ogg).export(tmp_wav, format='wav')
         r = sr.Recognizer()
         with sr.AudioFile(tmp_wav) as source:
             audio_data = r.record(source)
         return r.recognize_google(audio_data, language='ja-JP')
     finally:
-        for path in [tmp_ogg, tmp_wav]:
-            if path and os.path.exists(path):
-                os.unlink(path)
+        for p in [tmp_ogg, tmp_wav]:
+            if p and os.path.exists(p):
+                os.unlink(p)
 
 
 def split_message(text, limit=2000):
@@ -114,10 +224,37 @@ def split_message(text, limit=2000):
     return chunks
 
 
+# ───────────── バックグラウンド: リマインダーチェック ─────────────
+
+async def reminder_checker():
+    await discord_client.wait_until_ready()
+    while not discord_client.is_closed():
+        try:
+            loop = asyncio.get_event_loop()
+            due = await loop.run_in_executor(None, _get_due_reminders)
+            for r in due:
+                channel = discord_client.get_channel(int(r['channel_id']))
+                if channel:
+                    remind_jst = r['remind_at'].replace(tzinfo=timezone.utc).astimezone(JST)
+                    time_str = remind_jst.strftime("%-m月%-d日 %H:%M")
+                    await channel.send(
+                        f"{BOT_PREFIX}⏰ **リマインダー**\n"
+                        f"{r['username']}さん、{time_str}のリマインダーです！\n\n"
+                        f"📝 {r['message']}"
+                    )
+                await loop.run_in_executor(None, _mark_fired, r['id'])
+        except Exception as e:
+            print(f"リマインダーチェックエラー: {e}")
+        await asyncio.sleep(60)
+
+
+# ───────────── イベント ─────────────
+
 @discord_client.event
 async def on_ready():
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _init_db)
+    discord_client.loop.create_task(reminder_checker())
     print(f'Bot起動: {discord_client.user}')
 
 
@@ -144,7 +281,7 @@ async def on_message(message):
                 user_text = user_text.replace(f'<@{mention.id}>', '').replace(f'<@!{mention.id}>', '')
             user_text = user_text.strip()
 
-            # ボイスメッセージの文字起こし
+            # ボイスメッセージ文字起こし
             audio_attachment = next(
                 (a for a in message.attachments if a.content_type and a.content_type.startswith('audio/')),
                 None
@@ -154,13 +291,13 @@ async def on_message(message):
                 suffix = '.ogg' if 'ogg' in (audio_attachment.content_type or '') else '.wav'
                 try:
                     transcribed = await loop.run_in_executor(None, _transcribe_sync, audio_bytes, suffix)
-                    user_text = f"[ボイスメッセージ] {transcribed}" if not user_text else f"{user_text}\n[ボイスメッセージ] {transcribed}"
+                    user_text = f"{transcribed}" if not user_text else f"{user_text}\n{transcribed}"
                 except Exception as e:
                     print(f"文字起こし失敗: {e}")
                     await message.reply(f"{BOT_PREFIX}ボイスメッセージの文字起こしに失敗しました。")
                     return
 
-            # 画像の処理
+            # 画像処理
             image_attachments = [a for a in message.attachments if a.content_type and a.content_type.startswith('image/')]
             image_contents = []
             for img in image_attachments:
@@ -174,14 +311,62 @@ async def on_message(message):
             if not user_text and not image_contents:
                 return
 
-            history = await loop.run_in_executor(None, _load_history, channel_id)
+            # インテント判定
+            intent = _detect_intent(user_text)
 
-            # 画像がある場合はコンテンツをリスト形式で構築
+            # ── メモ一覧 ──
+            if intent == "memo_list":
+                rows = await loop.run_in_executor(None, _get_memos, channel_id)
+                if not rows:
+                    await message.reply(f"{BOT_PREFIX}メモはまだありません。")
+                    return
+                lines = []
+                for i, r in enumerate(rows, 1):
+                    jst_time = r['created_at'].replace(tzinfo=timezone.utc).astimezone(JST)
+                    lines.append(f"**{i}.** {jst_time.strftime('%-m/%-d %H:%M')} — {r['content']}")
+                await message.reply(f"{BOT_PREFIX}📝 **メモ一覧**\n" + "\n".join(lines))
+                return
+
+            # ── メモ保存 ──
+            if intent == "memo_save":
+                content = user_text
+                for kw in MEMO_SAVE_KEYWORDS:
+                    content = content.replace(kw, "").strip()
+                content = content.lstrip("：:").strip()
+                if not content:
+                    await message.reply(f"{BOT_PREFIX}メモの内容を教えてください。")
+                    return
+                await loop.run_in_executor(None, _save_memo, channel_id, str(message.author.id), str(message.author), content)
+                await message.reply(f"{BOT_PREFIX}✅ メモを保存しました！\n📝 {content}")
+                return
+
+            # ── リマインダー ──
+            if intent == "reminder":
+                try:
+                    parsed = await loop.run_in_executor(None, _parse_reminder, user_text)
+                    if "error" in parsed:
+                        await message.reply(f"{BOT_PREFIX}⚠️ 日時が読み取れませんでした。「5月10日の15時にリマインドして」のように教えてください。")
+                        return
+                    remind_at_jst = datetime.fromisoformat(parsed["remind_at"]).replace(tzinfo=JST)
+                    remind_at_utc = remind_at_jst.astimezone(timezone.utc).replace(tzinfo=None)
+                    await loop.run_in_executor(
+                        None, _save_reminder,
+                        channel_id, str(message.author.id), str(message.author.display_name),
+                        parsed["message"], remind_at_utc
+                    )
+                    time_str = remind_at_jst.strftime("%-m月%-d日 %H:%M")
+                    await message.reply(f"{BOT_PREFIX}⏰ リマインダーを設定しました！\n📅 {time_str}\n📝 {parsed['message']}")
+                except Exception as e:
+                    print(f"リマインダー設定エラー: {e}")
+                    await message.reply(f"{BOT_PREFIX}リマインダーの設定に失敗しました。日時をもう少し具体的に教えてください。")
+                return
+
+            # ── 通常チャット ──
+            history = await loop.run_in_executor(None, _load_history, channel_id)
             if image_contents:
                 user_content = image_contents + ([{"type": "text", "text": user_text}] if user_text else [{"type": "text", "text": "この画像について教えてください。"}])
             else:
                 user_content = user_text
-
             history.append({"role": "user", "content": user_content})
 
             response = anthropic_client.messages.create(
@@ -196,15 +381,13 @@ async def on_message(message):
             for block in response.content:
                 if hasattr(block, 'text'):
                     reply_text += block.text
-
             if not reply_text:
                 reply_text = "（応答を生成できませんでした）"
 
             save_text = user_text if user_text else f"[画像 {len(image_contents)}枚]"
             await loop.run_in_executor(None, _save_messages, channel_id, save_text, reply_text)
 
-            full_reply = BOT_PREFIX + reply_text
-            for chunk in split_message(full_reply):
+            for chunk in split_message(BOT_PREFIX + reply_text):
                 await message.reply(chunk)
 
         except Exception as e:
