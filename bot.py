@@ -1,5 +1,6 @@
 import os
 import asyncio
+import base64
 import tempfile
 import discord
 import anthropic
@@ -128,8 +129,9 @@ async def on_message(message):
     is_dm = isinstance(message.channel, discord.DMChannel)
     is_mentioned = discord_client.user in message.mentions
     has_audio = any(a.content_type and a.content_type.startswith('audio/') for a in message.attachments)
+    has_image = any(a.content_type and a.content_type.startswith('image/') for a in message.attachments)
 
-    if not (is_dm or is_mentioned or has_audio):
+    if not (is_dm or is_mentioned or has_audio or has_image):
         return
 
     channel_id = str(message.channel.id)
@@ -137,12 +139,12 @@ async def on_message(message):
 
     async with message.channel.typing():
         try:
-            # ボイスメッセージの文字起こし
             user_text = message.content
             for mention in message.mentions:
                 user_text = user_text.replace(f'<@{mention.id}>', '').replace(f'<@!{mention.id}>', '')
             user_text = user_text.strip()
 
+            # ボイスメッセージの文字起こし
             audio_attachment = next(
                 (a for a in message.attachments if a.content_type and a.content_type.startswith('audio/')),
                 None
@@ -158,11 +160,29 @@ async def on_message(message):
                     await message.reply(f"{BOT_PREFIX}ボイスメッセージの文字起こしに失敗しました。")
                     return
 
-            if not user_text:
+            # 画像の処理
+            image_attachments = [a for a in message.attachments if a.content_type and a.content_type.startswith('image/')]
+            image_contents = []
+            for img in image_attachments:
+                img_bytes = await img.read()
+                b64 = base64.standard_b64encode(img_bytes).decode('utf-8')
+                image_contents.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": img.content_type.split(';')[0], "data": b64}
+                })
+
+            if not user_text and not image_contents:
                 return
 
             history = await loop.run_in_executor(None, _load_history, channel_id)
-            history.append({"role": "user", "content": user_text})
+
+            # 画像がある場合はコンテンツをリスト形式で構築
+            if image_contents:
+                user_content = image_contents + ([{"type": "text", "text": user_text}] if user_text else [{"type": "text", "text": "この画像について教えてください。"}])
+            else:
+                user_content = user_text
+
+            history.append({"role": "user", "content": user_content})
 
             response = anthropic_client.messages.create(
                 model="claude-sonnet-4-6",
@@ -180,7 +200,8 @@ async def on_message(message):
             if not reply_text:
                 reply_text = "（応答を生成できませんでした）"
 
-            await loop.run_in_executor(None, _save_messages, channel_id, user_text, reply_text)
+            save_text = user_text if user_text else f"[画像 {len(image_contents)}枚]"
+            await loop.run_in_executor(None, _save_messages, channel_id, save_text, reply_text)
 
             full_reply = BOT_PREFIX + reply_text
             for chunk in split_message(full_reply):
