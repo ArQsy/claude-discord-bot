@@ -597,6 +597,10 @@ async def on_message(message):
                     suffix = '.wav'
                 try:
                     transcribed = await loop.run_in_executor(None, _transcribe_sync, audio_bytes, suffix)
+                    print(f"文字起こし結果: 「{transcribed}」")
+                    if len(transcribed) < 4:
+                        await message.reply(f"{BOT_PREFIX}⚠️ 音声認識がうまくいきませんでした（認識結果:「{transcribed}」）。\nもう少しゆっくり・はっきり話してみてください。")
+                        return
                     user_text = f"{transcribed}" if not user_text else f"{user_text}\n{transcribed}"
                 except Exception as e:
                     print(f"文字起こし失敗: {e}")
@@ -686,7 +690,7 @@ async def on_message(message):
 
                 # 現在地リンク方式（GPS）
                 if lat is None:
-                    keyword_match = re.search(r'(バー|居酒屋|レストラン|カフェ|コンビニ|薬局|スーパー|ラーメン|寿司|焼肉|ホテル|銭湯|[一-鿿]{1,6})', user_text)
+                    keyword_match = re.search(r'(バー|居酒屋|レストラン|カフェ|コンビニ|薬局|スーパー|ラーメン|寿司|焼肉|ホテル|銭湯|カラオケ|ドラッグストア|ドラスト|駐車場|ガソリンスタンド|スタバ|マック|マクドナルド)', user_text)
                     keyword = keyword_match.group(1) if keyword_match else "飲食店"
                     open_now = any(k in user_text for k in ["営業中", "今開いてる", "今やってる", "開いてる"])
                     radius_match = re.search(r'(\d+)\s*km', user_text)
