@@ -466,9 +466,13 @@ async function share() {
     });
     if (res.ok) {
       status.textContent = '';
-      document.querySelector('p').textContent = '';
+      document.querySelector('p').textContent = '2秒後にDiscordに戻ります';
       btn.textContent = '✅ 送信完了！';
       document.querySelector('h2').textContent = 'Discordに結果が届きます';
+      setTimeout(() => {
+        window.location.href = 'discord://';
+        setTimeout(() => { window.close(); }, 1000);
+      }, 2000);
     } else {
       status.textContent = 'エラーが発生しました';
       btn.disabled = false;
