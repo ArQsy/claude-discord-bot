@@ -333,41 +333,44 @@ PLACE_TYPE_MAP = {
 
 
 def _nearby_search(lat, lng, keyword, radius=2000, open_now=False):
-    """Places API で周辺スポットを検索"""
-    params = {
-        "location": f"{lat},{lng}",
-        "radius": radius,
-        "language": "ja",
-        "key": GOOGLE_MAPS_API_KEY,
-    }
-    # 日本語キーワードをAPIタイプに変換できる場合はtypeを使う
+    """Places API (New) で周辺スポットを検索"""
     place_type = PLACE_TYPE_MAP.get(keyword)
-    if place_type:
-        params["type"] = place_type
-    else:
-        params["keyword"] = keyword
 
-    if open_now:
-        params["opennow"] = "true"
+    def _search(r):
+        body = {
+            "locationRestriction": {
+                "circle": {
+                    "center": {"latitude": lat, "longitude": lng},
+                    "radius": float(r)
+                }
+            },
+            "maxResultCount": 20,
+            "languageCode": "ja",
+        }
+        if place_type:
+            body["includedTypes"] = [place_type]
+        else:
+            body["textQuery"] = keyword  # テキスト検索にフォールバック
 
-    r = requests.get(
-        "https://maps.googleapis.com/maps/api/place/nearbysearch/json",
-        params=params, timeout=10
-    )
-    results = r.json().get("results", [])
-    print(f"Places API: {len(results)}件 (type={place_type}, keyword={keyword}, radius={radius})")
-
-    # 結果が少なければ半径を広げて再試行
-    if len(results) < 3 and radius < 5000:
-        params["radius"] = 5000
-        params.pop("opennow", None)
-        r2 = requests.get(
-            "https://maps.googleapis.com/maps/api/place/nearbysearch/json",
-            params=params, timeout=10
+        resp = requests.post(
+            "https://places.googleapis.com/v1/places:searchNearby",
+            headers={
+                "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
+                "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.location,places.regularOpeningHours",
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=15,
         )
-        results = r2.json().get("results", []) or results
-        print(f"Places API (拡大): {len(results)}件")
+        print(f"Places API (New): {resp.status_code} radius={r} type={place_type} keyword={keyword}")
+        if resp.status_code != 200:
+            print(f"  エラー詳細: {resp.text[:300]}")
+            return []
+        return resp.json().get("places", [])
 
+    results = _search(radius)
+    if len(results) < 3:
+        results = _search(5000) or results
     return results
 
 
@@ -382,22 +385,22 @@ def _haversine(lat1, lng1, lat2, lng2):
 
 
 def _format_places(places, lat, lng, limit=8):
-    """検索結果を整形"""
+    """Places API (New) の検索結果を整形"""
     lines = []
     for i, p in enumerate(places[:limit], 1):
-        name = p.get("name", "不明")
+        name = p.get("displayName", {}).get("text", "不明")
         rating = p.get("rating", "-")
-        user_ratings = p.get("user_ratings_total", 0)
-        vicinity = p.get("vicinity", "")
-        place_id = p.get("place_id", "")
-        loc = p.get("geometry", {}).get("location", {})
-        dist = int(_haversine(lat, lng, loc.get("lat", lat), loc.get("lng", lng)))
+        user_ratings = p.get("userRatingCount", 0)
+        address = p.get("formattedAddress", "")
+        place_id = p.get("id", "")
+        loc = p.get("location", {})
+        dist = int(_haversine(lat, lng, loc.get("latitude", lat), loc.get("longitude", lng)))
         maps_url = f"https://www.google.com/maps/place/?q=place_id:{place_id}"
-        open_now = p.get("opening_hours", {}).get("open_now")
+        open_now = p.get("regularOpeningHours", {}).get("openNow")
         status = "🟢 営業中" if open_now else ("🔴 営業時間外" if open_now is False else "")
         lines.append(
             f"**{i}. {name}** ⭐{rating}（{user_ratings}件）{' ' + status if status else ''}\n"
-            f"　📍 {vicinity}（約{dist}m）\n"
+            f"　📍 {address}（約{dist}m）\n"
             f"　🔗 {maps_url}"
         )
     return "\n\n".join(lines)
