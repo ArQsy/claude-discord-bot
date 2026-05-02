@@ -6,6 +6,7 @@ import uuid
 import asyncio
 import base64
 import tempfile
+import time
 from datetime import datetime, timezone, timedelta
 import discord
 import anthropic
@@ -23,8 +24,9 @@ GOOGLE_MAPS_API_KEY = os.environ.get('GOOGLE_MAPS_API_KEY', '')
 PORT = int(os.environ.get('PORT', 8080))
 BOT_BASE_URL = os.environ.get('BOT_BASE_URL', '')  # 例: https://xxx.up.railway.app
 
-# 位置情報リクエストの一時保存 {token: (channel_id, keyword, radius, open_now)}
-_pending_locations = {}
+# 位置情報リクエストの一時保存 {token: (channel_id, keyword, radius, open_now, expires_at)}
+_pending_locations: dict[str, tuple] = {}
+_PENDING_LOCATION_TTL = 600  # 10分
 
 JST = timezone(timedelta(hours=9))
 
@@ -217,12 +219,14 @@ def _detect_intent(text):
         return "memo_list"
     if any(k in text for k in MEMO_SAVE_KEYWORDS):
         return "memo_save"
-    if any(k in text for k in MAP_KEYWORDS) and ('maps.google' in text or 'goo.gl' in text or 'maps.app' in text or any(k in text for k in ["近くの", "付近の", "周辺の"])):
-        return "map_search"
-    if any(k in text for k in TRAVEL_KEYWORDS):
-        return "travel"
+    # 予約はtravelより先に評価（「旅行の予約」を予約として扱う）
     if any(k in text for k in RESERVATION_KEYWORDS):
         return "reservation"
+    if any(k in text for k in TRAVEL_KEYWORDS):
+        return "travel"
+    # map_search: マップ系キーワードがあればURLなしでも検出
+    if any(k in text for k in MAP_KEYWORDS):
+        return "map_search"
     if any(k in text for k in REMINDER_KEYWORDS):
         return "reminder"
     return "chat"
@@ -232,7 +236,7 @@ def _parse_reminder(text):
     """Claudeで日時とメッセージを抽出（Haiku使用でコスト節約）"""
     now_jst = datetime.now(JST).strftime("%Y年%m月%d日 %H:%M")
     response = anthropic_client.messages.create(
-        model="claude-haiku-4-5-20251001",
+        model="claude-haiku-4-5",
         max_tokens=200,
         system=f"""現在の日時（JST）: {now_jst}
 ユーザーのメッセージからリマインダーの日時と内容を抽出してください。
@@ -242,6 +246,8 @@ def _parse_reminder(text):
         messages=[{"role": "user", "content": text}]
     )
     raw = response.content[0].text.strip()
+    # コードブロックで囲まれている場合に除去
+    raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw, flags=re.MULTILINE).strip()
     return json.loads(raw)
 
 
@@ -356,7 +362,9 @@ def _transcribe_sync(audio_bytes, suffix='.ogg'):
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
             f.write(audio_bytes)
             tmp_ogg = f.name
-        tmp_wav = tmp_ogg.replace(suffix, '.wav')
+        # suffixを除去して.wavを付与（パス内にsuffixが含まれても安全）
+        base = tmp_ogg[:-len(suffix)] if tmp_ogg.endswith(suffix) else tmp_ogg
+        tmp_wav = base + '.wav'
         AudioSegment.from_file(tmp_ogg).export(tmp_wav, format='wav')
         r = sr.Recognizer()
         with sr.AudioFile(tmp_wav) as source:
@@ -460,10 +468,14 @@ async def handle_location_submit(request):
         lat = float(data.get('lat', 0))
         lng = float(data.get('lng', 0))
 
-        if token not in _pending_locations:
+        entry = _pending_locations.get(token)
+        if entry is None:
             return web.Response(status=400, text='Invalid token')
+        if time.monotonic() > entry[4]:
+            _pending_locations.pop(token, None)
+            return web.Response(status=400, text='Token expired')
 
-        channel_id, keyword, radius, open_now = _pending_locations.pop(token)
+        channel_id, keyword, radius, open_now, _ = _pending_locations.pop(token)
         channel = discord_client.get_channel(int(channel_id))
         if not channel:
             return web.Response(status=400, text='Channel not found')
@@ -500,11 +512,19 @@ async def start_web_server():
     print(f'Webサーバー起動: port {PORT}')
 
 
+def _cleanup_pending_locations():
+    """期限切れのトークンを削除"""
+    now = time.monotonic()
+    expired = [t for t, v in _pending_locations.items() if now > v[4]]
+    for t in expired:
+        del _pending_locations[t]
+
+
 async def reminder_checker():
     await discord_client.wait_until_ready()
     while not discord_client.is_closed():
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             due = await loop.run_in_executor(None, _get_due_reminders)
             for r in due:
                 channel = discord_client.get_channel(int(r['channel_id']))
@@ -517,6 +537,8 @@ async def reminder_checker():
                         f"📝 {r['message']}"
                     )
                 await loop.run_in_executor(None, _mark_fired, r['id'])
+            # 期限切れ位置情報トークンを定期削除
+            _cleanup_pending_locations()
         except Exception as e:
             print(f"リマインダーチェックエラー: {e}")
         await asyncio.sleep(60)
@@ -526,10 +548,10 @@ async def reminder_checker():
 
 @discord_client.event
 async def on_ready():
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _init_db)
-    discord_client.loop.create_task(reminder_checker())
-    discord_client.loop.create_task(start_web_server())
+    asyncio.ensure_future(reminder_checker())
+    asyncio.ensure_future(start_web_server())
     print(f'Bot起動: {discord_client.user}')
 
 
@@ -547,7 +569,7 @@ async def on_message(message):
         return
 
     channel_id = str(message.channel.id)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     async with message.channel.typing():
         try:
@@ -563,7 +585,15 @@ async def on_message(message):
             )
             if audio_attachment:
                 audio_bytes = await audio_attachment.read()
-                suffix = '.ogg' if 'ogg' in (audio_attachment.content_type or '') else '.wav'
+                ct = audio_attachment.content_type or ''
+                if 'ogg' in ct:
+                    suffix = '.ogg'
+                elif 'mp4' in ct or 'aac' in ct or 'm4a' in ct:
+                    suffix = '.mp4'
+                elif 'webm' in ct:
+                    suffix = '.webm'
+                else:
+                    suffix = '.wav'
                 try:
                     transcribed = await loop.run_in_executor(None, _transcribe_sync, audio_bytes, suffix)
                     user_text = f"{transcribed}" if not user_text else f"{user_text}\n{transcribed}"
@@ -662,7 +692,7 @@ async def on_message(message):
                     radius = int(float(radius_match.group(1)) * 1000) if radius_match else 1000
 
                     token = str(uuid.uuid4())[:8]
-                    _pending_locations[token] = (channel_id, keyword, radius, open_now)
+                    _pending_locations[token] = (channel_id, keyword, radius, open_now, time.monotonic() + _PENDING_LOCATION_TTL)
 
                     if BOT_BASE_URL:
                         link = f"{BOT_BASE_URL}/location?token={token}"
@@ -699,13 +729,15 @@ async def on_message(message):
 
             # ── 旅行検索 ──
             if intent == "travel":
-                response = anthropic_client.messages.create(
-                    model="claude-sonnet-4-6",
-                    max_tokens=2048,
-                    system=TRAVEL_SYSTEM_PROMPT,
-                    tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
-                    messages=[{"role": "user", "content": user_text}],
-                )
+                def _call_travel():
+                    return anthropic_client.messages.create(
+                        model="claude-sonnet-4-6",
+                        max_tokens=2048,
+                        system=TRAVEL_SYSTEM_PROMPT,
+                        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
+                        messages=[{"role": "user", "content": user_text}],
+                    )
+                response = await loop.run_in_executor(None, _call_travel)
                 reply_text = ""
                 for block in response.content:
                     if hasattr(block, 'text'):
@@ -718,13 +750,15 @@ async def on_message(message):
 
             # ── 予約サポート ──
             if intent == "reservation":
-                response = anthropic_client.messages.create(
-                    model="claude-sonnet-4-6",
-                    max_tokens=2048,
-                    system=RESERVATION_SYSTEM_PROMPT,
-                    tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
-                    messages=[{"role": "user", "content": user_text}],
-                )
+                def _call_reservation():
+                    return anthropic_client.messages.create(
+                        model="claude-sonnet-4-6",
+                        max_tokens=2048,
+                        system=RESERVATION_SYSTEM_PROMPT,
+                        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
+                        messages=[{"role": "user", "content": user_text}],
+                    )
+                response = await loop.run_in_executor(None, _call_reservation)
                 reply_text = ""
                 for block in response.content:
                     if hasattr(block, 'text'):
@@ -743,13 +777,15 @@ async def on_message(message):
                 user_content = user_text
             history.append({"role": "user", "content": user_content})
 
-            response = anthropic_client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=8096,
-                system=SYSTEM_PROMPT,
-                tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
-                messages=history,
-            )
+            def _call_chat():
+                return anthropic_client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=8096,
+                    system=SYSTEM_PROMPT,
+                    tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
+                    messages=history,
+                )
+            response = await loop.run_in_executor(None, _call_chat)
 
             reply_text = ""
             for block in response.content:
