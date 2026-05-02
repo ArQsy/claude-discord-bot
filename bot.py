@@ -243,30 +243,33 @@ def _parse_reminder(text):
 _BROWSER_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
 
 def _extract_coords(text):
-    """テキスト中のGoogle Maps URLから座標を抽出"""
-    patterns = [
+    """テキストから座標を抽出（URL・生座標・Google Maps URL対応）"""
+    # ① 生座標（例: 35.6762, 139.6503 または 35.6762,139.6503）
+    m = re.search(r'(-?\d{1,3}\.\d{4,})[,\s]+(-?\d{1,3}\.\d{4,})', text)
+    if m:
+        lat, lng = float(m.group(1)), float(m.group(2))
+        if -90 <= lat <= 90 and -180 <= lng <= 180:
+            return lat, lng
+
+    # ② URLに含まれる座標パターン
+    url_patterns = [
         r'[?&]q=(-?\d+\.\d+),(-?\d+\.\d+)',
         r'/@(-?\d+\.\d+),(-?\d+\.\d+)',
         r'll=(-?\d+\.\d+),(-?\d+\.\d+)',
         r'!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)',
-        r'center=(-?\d+\.\d+)%2C(-?\d+\.\d+)',
     ]
-    urls = re.findall(r'https?://\S+', text)
-    for url in urls:
-        # まずURLそのままで試す
-        for pat in patterns:
+    for url in re.findall(r'https?://\S+', text):
+        for pat in url_patterns:
             m = re.search(pat, url)
             if m:
                 return float(m.group(1)), float(m.group(2))
-        # 短縮URLはリダイレクト先を追跡
+        # 短縮URLのリダイレクト追跡
         if 'goo.gl' in url or 'maps.app' in url:
             try:
                 r = requests.get(url, allow_redirects=True, timeout=8,
                                  headers={'User-Agent': _BROWSER_UA})
-                expanded = r.url
-                print(f"展開URL: {expanded}")
-                for pat in patterns:
-                    m = re.search(pat, expanded)
+                for pat in url_patterns:
+                    m = re.search(pat, r.url)
                     if m:
                         return float(m.group(1)), float(m.group(2))
             except Exception as e:
@@ -531,9 +534,12 @@ async def on_message(message):
 
                 if lat is None:
                     await message.reply(
-                        f"{BOT_PREFIX}📍 場所を特定できませんでした。以下のいずれかの方法で教えてください：\n\n"
-                        f"① Google Mapsで現在地を長押し → 「共有」→ リンクを貼る\n"
-                        f"② 駅名や地名を入れる（例：「渋谷駅近くの営業中のバー」）"
+                        f"{BOT_PREFIX}📍 場所を特定できませんでした。以下のいずれかで教えてください：\n\n"
+                        f"**① 座標を貼る（一番確実）**\n"
+                        f"Google Maps → 現在地を長押し → 画面下に出る数字をタップ → コピー → 貼り付け\n"
+                        f"例：`35.6762, 139.6503`\n\n"
+                        f"**② 駅名・地名で指定**\n"
+                        f"例：「渋谷駅近くの今開いてるバー」"
                     )
                     return
 
