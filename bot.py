@@ -21,6 +21,7 @@ DISCORD_BOT_TOKEN = os.environ['DISCORD_BOT_TOKEN']
 ANTHROPIC_API_KEY = os.environ['ANTHROPIC_API_KEY']
 DATABASE_URL = os.environ['DATABASE_URL']
 GOOGLE_MAPS_API_KEY = os.environ.get('GOOGLE_MAPS_API_KEY', '')
+AQUAVOICE_API_KEY = os.environ.get('AQUAVOICE_API_KEY', '')
 PORT = int(os.environ.get('PORT', 8080))
 _raw_base_url = os.environ.get('BOT_BASE_URL', '')
 BOT_BASE_URL = f"https://{_raw_base_url}" if _raw_base_url and not _raw_base_url.startswith('http') else _raw_base_url
@@ -358,12 +359,15 @@ def _format_places(places, lat, lng, limit=8):
 
 
 def _transcribe_sync(audio_bytes, suffix='.ogg'):
+    # AquaVoice APIが設定されていればそちらを優先
+    if AQUAVOICE_API_KEY:
+        return _transcribe_aquavoice(audio_bytes, suffix)
+    # フォールバック: Google Speech Recognition
     tmp_ogg = tmp_wav = None
     try:
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
             f.write(audio_bytes)
             tmp_ogg = f.name
-        # suffixを除去して.wavを付与（パス内にsuffixが含まれても安全）
         base = tmp_ogg[:-len(suffix)] if tmp_ogg.endswith(suffix) else tmp_ogg
         tmp_wav = base + '.wav'
         AudioSegment.from_file(tmp_ogg).export(tmp_wav, format='wav')
@@ -375,6 +379,27 @@ def _transcribe_sync(audio_bytes, suffix='.ogg'):
         for p in [tmp_ogg, tmp_wav]:
             if p and os.path.exists(p):
                 os.unlink(p)
+
+
+def _transcribe_aquavoice(audio_bytes, suffix='.ogg'):
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+            f.write(audio_bytes)
+            tmp_path = f.name
+        with open(tmp_path, 'rb') as f:
+            resp = requests.post(
+                'https://api.aquavoice.com/api/v1/audio/transcriptions',
+                headers={'Authorization': f'Bearer {AQUAVOICE_API_KEY}'},
+                files={'file': (f'audio{suffix}', f)},
+                data={'model': 'avalon-v1.5'},
+                timeout=30,
+            )
+        resp.raise_for_status()
+        return resp.json().get('text', '')
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 def split_message(text, limit=2000):
