@@ -22,6 +22,7 @@ ANTHROPIC_API_KEY = os.environ['ANTHROPIC_API_KEY']
 DATABASE_URL = os.environ['DATABASE_URL']
 GOOGLE_MAPS_API_KEY = os.environ.get('GOOGLE_MAPS_API_KEY', '')
 AQUAVOICE_API_KEY = os.environ.get('AQUAVOICE_API_KEY', '')
+JARVIS_LOG_CHANNEL_ID = os.environ.get('JARVIS_LOG_CHANNEL_ID', '')
 PORT = int(os.environ.get('PORT', 8080))
 _raw_base_url = os.environ.get('BOT_BASE_URL', '')
 BOT_BASE_URL = f"https://{_raw_base_url}" if _raw_base_url and not _raw_base_url.startswith('http') else _raw_base_url
@@ -50,6 +51,12 @@ MEMO_LIST_KEYWORDS = ["メモ見せて", "メモ一覧", "メモを教えて", "
 RESERVATION_KEYWORDS = ["予約", "席を取って", "予約して", "予約したい", "ご予約", "席の予約"]
 TRAVEL_KEYWORDS = ["航空券", "飛行機", "ホテル", "宿", "ツアー", "旅行", "格安", "安いフライト", "旅館", "パック旅行", "ANA", "JAL", "LCC"]
 MAP_KEYWORDS = ["近く", "現在地", "付近", "周辺", "近い", "近くの", "今開いてる", "営業中", "地図", "マップ"]
+# JARVISへのパス：PC操作・ローカル作業・明示的な指示
+JARVIS_KEYWORDS = ["JARVISに", "ジャービスに", "JARVISで", "jarvisに", "PCで", "PCの", "ファイルを", "フォルダを",
+                   "RECONを", "スクリプトを", "ターミナルで", "ローカルで", "自動化して", "PCを起動", "PCを操作"]
+JARVIS_MEMORY_SAVE_KEYWORDS = ["JARVIS記憶して", "JARVISに覚えさせて", "JARVIS覚えて"]
+JARVIS_MEMORY_LIST_KEYWORDS = ["JARVISの記憶", "JARVIS記憶一覧", "JARVISが覚えてること"]
+JARVIS_LOG_KEYWORDS = ["JARVISのログ", "JARVISの会話履歴", "JARVISと何を話した"]
 
 TRAVEL_SYSTEM_PROMPT = """あなたは旅行・交通のお得情報を探すアシスタントです。
 ユーザーの条件（出発地・目的地・日程・人数・予算）を整理し、ウェブ検索で最安値に近い選択肢を見つけてください。
@@ -99,6 +106,26 @@ def _get_conn():
 def _init_db():
     with _get_conn() as conn:
         with conn.cursor() as cur:
+            # JARVIS連携テーブル
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS jarvis_queue (
+                    id SERIAL PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    speak BOOLEAN DEFAULT FALSE,
+                    channel_id TEXT,
+                    status TEXT DEFAULT 'pending',
+                    response TEXT,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    processed_at TIMESTAMP
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS jarvis_memory (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS discord_conversations (
                     id SERIAL PRIMARY KEY,
@@ -227,7 +254,76 @@ def _get_memos(channel_id, limit=10):
 
 # ───────────── インテント判定 ─────────────
 
+# ───────────── JARVIS連携 DB関数 ─────────────
+
+def _jarvis_enqueue(payload: str, channel_id: str, speak: bool = False) -> int:
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO jarvis_queue (payload, channel_id, speak) VALUES (%s,%s,%s) RETURNING id",
+                (payload, channel_id, speak),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return row[0]
+
+
+def _jarvis_get_response(queue_id: int) -> str | None:
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT status, response FROM jarvis_queue WHERE id=%s",
+                (queue_id,),
+            )
+            row = cur.fetchone()
+    if row and row[0] in ("done", "error"):
+        return row[1] or "（応答なし）"
+    return None
+
+
+def _jarvis_memory_save(key: str, value: str) -> None:
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO jarvis_memory (key, value, updated_at)
+                   VALUES (%s,%s,NOW())
+                   ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()""",
+                (key, value),
+            )
+        conn.commit()
+
+
+def _jarvis_memory_list() -> list[tuple[str, str]]:
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT key, value FROM jarvis_memory ORDER BY updated_at DESC LIMIT 20")
+            return cur.fetchall()
+
+
+def _jarvis_log_history(limit: int = 10) -> list[dict]:
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute(
+                """SELECT role, content FROM discord_conversations
+                   WHERE channel_id='jarvis_local'
+                   ORDER BY created_at DESC LIMIT %s""",
+                (limit,),
+            )
+            rows = cur.fetchall()
+    return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+
+# ───────────── インテント判定 ─────────────
+
 def _detect_intent(text):
+    if any(k in text for k in JARVIS_LOG_KEYWORDS):
+        return "jarvis_log"
+    if any(k in text for k in JARVIS_MEMORY_LIST_KEYWORDS):
+        return "jarvis_memory_list"
+    if any(k in text for k in JARVIS_MEMORY_SAVE_KEYWORDS):
+        return "jarvis_memory_save"
+    if any(k in text for k in JARVIS_KEYWORDS):
+        return "jarvis_task"
     if any(k in text for k in MEMO_LIST_KEYWORDS):
         return "memo_list"
     if any(k in text for k in MEMO_SAVE_KEYWORDS):
@@ -736,6 +832,68 @@ async def on_message(message):
 
             # インテント判定
             intent = _detect_intent(user_text)
+
+            # ── JARVIS ログ表示 ──
+            if intent == "jarvis_log":
+                rows = await loop.run_in_executor(None, _jarvis_log_history, 10)
+                if not rows:
+                    await message.reply(f"{BOT_PREFIX}JARVISの会話履歴はまだありません。")
+                    return
+                lines = [f"**{r['role']}:** {r['content'][:100]}" for r in rows]
+                await message.reply(f"{BOT_PREFIX}🖥️ **JARVIS 直近の会話**\n" + "\n".join(lines))
+                return
+
+            # ── JARVIS 記憶一覧 ──
+            if intent == "jarvis_memory_list":
+                items = await loop.run_in_executor(None, _jarvis_memory_list)
+                if not items:
+                    await message.reply(f"{BOT_PREFIX}JARVISの記憶はまだありません。")
+                    return
+                lines = [f"**{k}**: {v}" for k, v in items]
+                await message.reply(f"{BOT_PREFIX}🧠 **JARVIS 記憶一覧**\n" + "\n".join(lines))
+                return
+
+            # ── JARVIS 記憶保存 ──
+            if intent == "jarvis_memory_save":
+                content = user_text
+                for kw in JARVIS_MEMORY_SAVE_KEYWORDS:
+                    content = content.replace(kw, "").strip()
+                content = content.lstrip("：:").strip()
+                if ":" in content or "：" in content:
+                    sep = "：" if "：" in content else ":"
+                    key, value = content.split(sep, 1)
+                    await loop.run_in_executor(None, _jarvis_memory_save, key.strip(), value.strip())
+                    await message.reply(f"{BOT_PREFIX}🧠 記憶しました。\n**{key.strip()}**: {value.strip()}")
+                else:
+                    await loop.run_in_executor(None, _jarvis_memory_save, f"memo_{int(time.time())}", content)
+                    await message.reply(f"{BOT_PREFIX}🧠 記憶しました: {content}")
+                return
+
+            # ── JARVIS タスクパス ──
+            if intent == "jarvis_task":
+                payload = user_text
+                for kw in JARVIS_KEYWORDS:
+                    payload = payload.replace(kw, "").strip()
+                payload = payload or user_text
+                queue_id = await loop.run_in_executor(None, _jarvis_enqueue, payload, channel_id, False)
+                await message.reply(f"{BOT_PREFIX}🖥️ JARVISにタスクを送りました。返答を待っています…")
+                # 最大60秒ポーリング
+                for _ in range(30):
+                    await asyncio.sleep(2)
+                    response = await loop.run_in_executor(None, _jarvis_get_response, queue_id)
+                    if response:
+                        for chunk in split_message(f"{BOT_PREFIX}🖥️ **JARVIS より:**\n{response}"):
+                            await message.reply(chunk)
+                        # ログチャンネルにも投稿
+                        if JARVIS_LOG_CHANNEL_ID:
+                            log_ch = discord_client.get_channel(int(JARVIS_LOG_CHANNEL_ID))
+                            if log_ch:
+                                await log_ch.send(
+                                    f"📲 **[Discord → JARVIS]**\n**依頼:** {payload}\n**返答:** {response[:500]}"
+                                )
+                        return
+                await message.reply(f"{BOT_PREFIX}⏳ JARVISが応答しませんでした（60秒タイムアウト）。PCが起動しているか確認してください。")
+                return
 
             # ── メモ一覧 ──
             if intent == "memo_list":
