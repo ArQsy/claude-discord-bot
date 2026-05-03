@@ -315,7 +315,13 @@ def _jarvis_log_history(limit: int = 10) -> list[dict]:
 
 # ───────────── インテント判定 ─────────────
 
+def _normalize_jarvis(text: str) -> str:
+    """音声認識による JARVIS の誤認識を正規化"""
+    return re.sub(r'[Jj]ervis|[Jj]arvis|ジャービス|じゃーびす', 'JARVIS', text)
+
+
 def _detect_intent(text):
+    text = _normalize_jarvis(text)
     if any(k in text for k in JARVIS_LOG_KEYWORDS):
         return "jarvis_log"
     if any(k in text for k in JARVIS_MEMORY_LIST_KEYWORDS):
@@ -871,7 +877,7 @@ async def on_message(message):
 
             # ── JARVIS タスクパス ──
             if intent == "jarvis_task":
-                payload = user_text
+                payload = _normalize_jarvis(user_text)
                 for kw in JARVIS_KEYWORDS:
                     payload = payload.replace(kw, "").strip()
                 payload = payload or user_text
