@@ -32,6 +32,9 @@ BOT_BASE_URL = f"https://{_raw_base_url}" if _raw_base_url and not _raw_base_url
 _pending_locations: dict[str, tuple] = {}
 _PENDING_LOCATION_TTL = 600  # 10分
 
+# 直前の検索結果キャッシュ {channel_id: (places, lat, lng)}
+_last_places_cache: dict[str, tuple] = {}
+
 JST = timezone(timedelta(hours=9))
 
 intents = discord.Intents.default()
@@ -730,6 +733,9 @@ def split_message(text, limit=2000):
 
 async def _send_places_result(channel, places, lat, lng, keyword, radius, open_now, loop, reference=None):
     """地図検索結果テキスト＋写真をDiscordに送信"""
+    # 後から写真リクエストできるようキャッシュ保存
+    _last_places_cache[str(channel.id)] = (places, lat, lng)
+
     open_label = "（営業中のみ）" if open_now else ""
     header = f"📍 現在地から半径{radius}m以内の**{keyword}**{open_label}\n\n"
     body = _format_places(places, lat, lng)
@@ -991,6 +997,10 @@ async def on_message(message):
                     intent = "note_idea"
                 elif any(k in user_text for k in CARD_PRICE_KEYWORDS):
                     intent = "card_price"
+            # テキストのみで「写真」＋キャッシュあり → 写真リクエスト
+            if not image_contents and intent == "chat":
+                if any(k in user_text for k in ["写真", "フォト", "画像"]) and channel_id in _last_places_cache:
+                    intent = "photo_request"
 
             # ── JARVIS ログ表示 ──
             if intent == "jarvis_log":
@@ -1245,6 +1255,24 @@ async def on_message(message):
                     reply_text = "予約ページの検索に失敗しました。お店名と日時をもう少し詳しく教えてください。"
                 for chunk in split_message(BOT_PREFIX + reply_text):
                     await message.reply(chunk)
+                return
+
+            # ── 写真リクエスト（直前の検索キャッシュから） ──
+            if intent == "photo_request":
+                cache = _last_places_cache.get(channel_id)
+                if not cache:
+                    await message.reply(f"{BOT_PREFIX}直前の検索結果が見つかりません。先に周辺スポットを検索してください。")
+                    return
+                places_cached, lat_c, lng_c = cache
+                await message.reply(f"{BOT_PREFIX}📸 写真を取得しています…")
+                photos = await loop.run_in_executor(None, _fetch_place_photos_sync, places_cached, 3)
+                if not photos:
+                    await message.reply(f"{BOT_PREFIX}写真を取得できませんでした（Places APIに写真データがない可能性があります）。")
+                    return
+                files = [discord.File(io.BytesIO(data), filename=f"photo_{i+1}.jpg")
+                         for i, (_, data) in enumerate(photos)]
+                caption = "📸 " + " / ".join(n for n, _ in photos)
+                await message.reply(caption, files=files)
                 return
 
             # ── noteネタ生成（画像→記事アイデア） ──
