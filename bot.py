@@ -512,7 +512,13 @@ def _geocode(address):
         return None, None
     r = requests.get(
         "https://maps.googleapis.com/maps/api/geocode/json",
-        params={"address": address, "language": "ja", "key": GOOGLE_MAPS_API_KEY},
+        params={
+            "address": address,
+            "language": "ja",
+            "region": "jp",
+            "components": "country:JP",
+            "key": GOOGLE_MAPS_API_KEY,
+        },
         timeout=10
     )
     data = r.json()
@@ -1248,9 +1254,17 @@ async def on_message(message):
                         )
                     return
 
-                # 検索キーワード抽出（バー・レストラン・コンビニ等）
-                keyword_match = re.search(r'(バー|居酒屋|レストラン|カフェ|コンビニ|薬局|スーパー|ラーメン|寿司|焼肉|ホテル|銭湯|[一-鿿]{1,6})', user_text)
-                keyword = keyword_match.group(1) if keyword_match else "飲食店"
+                # 検索キーワード抽出（地名を除いてから食べ物・施設を探す）
+                # ※ [一-鿿]{1,6} の漢字一括マッチは地名を誤って拾うため除去
+                text_for_kw = user_text.replace(place_match.group(1), "") if place_match else user_text
+                keyword_match = re.search(
+                    r'(バー|居酒屋|レストラン|カフェ|コンビニ|薬局|スーパー|ラーメン|寿司|焼肉|ホテル|銭湯|カラオケ|ドラッグストア|スタバ|マック|マクドナルド|うどん|そば|ピザ|焼き鳥|天ぷら|定食)',
+                    text_for_kw
+                )
+                if keyword_match:
+                    keyword = keyword_match.group(1)
+                else:
+                    keyword = next((f for f in FOOD_KEYWORDS if f in text_for_kw), "飲食店")
                 open_now = any(k in user_text for k in ["営業中", "今開いてる", "今やってる", "開いてる"])
 
                 radius_match = re.search(r'(\d+)\s*km', user_text)
