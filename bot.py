@@ -581,9 +581,13 @@ def _fetch_place_photos_sync(places, limit=3):
         url = f"https://places.googleapis.com/v1/{photo_name}/media?maxWidthPx=800&key={GOOGLE_MAPS_API_KEY}"
         try:
             resp = requests.get(url, timeout=10, allow_redirects=True)
-            if resp.status_code == 200 and resp.content:
+            if (resp.status_code == 200
+                    and resp.content
+                    and resp.headers.get('content-type', '').startswith('image/')):
                 name = p.get("displayName", {}).get("text", "店舗")
                 result.append((name, resp.content))
+            elif resp.status_code != 200:
+                print(f"写真取得失敗 ({p.get('displayName', {}).get('text', '')}): status={resp.status_code}")
         except Exception as e:
             print(f"写真取得失敗 ({p.get('displayName', {}).get('text', '')}): {e}")
     return result
@@ -1000,13 +1004,16 @@ async def on_message(message):
                     await message.reply(f"{BOT_PREFIX}提案内容を書いてください。\n例：「提案: 検索結果に評価フィルターを追加してほしい」")
                     return
                 await loop.run_in_executor(None, _save_proposal, str(message.author), content)
-                # JARVISにファイル追記を依頼（fire-and-forget）
+                # JARVISにファイル追記を依頼（失敗しても提案保存は成功扱い）
                 now_str = datetime.now(JST).strftime('%Y/%m/%d %H:%M')
                 file_task = (
                     f"C:\\Users\\makur\\claude-proposals.md というファイルに以下の1行を追記してください"
                     f"（ファイルがなければ新規作成）:\n- [{now_str}] {content}"
                 )
-                await loop.run_in_executor(None, _jarvis_enqueue, file_task, channel_id, False)
+                try:
+                    await loop.run_in_executor(None, _jarvis_enqueue, file_task, channel_id, False)
+                except Exception as e:
+                    print(f"JARVIS enqueue失敗（提案はDB保存済み）: {e}")
                 await message.reply(
                     f"{BOT_PREFIX}✅ Claudeへの提案を送りました！\n"
                     f"📝 {content}\n"
