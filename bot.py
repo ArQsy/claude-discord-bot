@@ -585,12 +585,15 @@ def _nearby_search(lat, lng, keyword, radius=2000, open_now=False):
             }
             endpoint = "https://places.googleapis.com/v1/places:searchNearby"
         else:
-            # searchText: キーワード検索（locationRestrictionで範囲を厳密に絞る）
+            # searchText: キーワード検索
+            # locationBias（優先）＋rankPreference DISTANCE（近い順）で精度を確保
+            # locationRestrictionは厳密すぎてヒット0になるケースがあるため使わない
             body = {
                 "textQuery": keyword,
-                "locationRestriction": {
+                "locationBias": {
                     "circle": {"center": {"latitude": lat, "longitude": lng}, "radius": float(r)}
                 },
+                "rankPreference": "DISTANCE",
                 "maxResultCount": 20,
                 "languageCode": "ja",
             }
