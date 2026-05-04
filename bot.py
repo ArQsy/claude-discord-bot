@@ -507,9 +507,9 @@ def _extract_coords(text):
 
 
 def _geocode(address):
-    """住所・地名を座標に変換"""
+    """住所・地名を座標に変換。(lat, lng, formatted_address) を返す"""
     if not GOOGLE_MAPS_API_KEY:
-        return None, None
+        return None, None, None
     r = requests.get(
         "https://maps.googleapis.com/maps/api/geocode/json",
         params={
@@ -523,9 +523,26 @@ def _geocode(address):
     )
     data = r.json()
     if data.get("results"):
-        loc = data["results"][0]["geometry"]["location"]
-        return loc["lat"], loc["lng"]
-    return None, None
+        result = data["results"][0]
+        loc = result["geometry"]["location"]
+        formatted = result.get("formatted_address", "").replace("日本、", "")
+        return loc["lat"], loc["lng"], formatted
+    return None, None, None
+
+
+# 都道府県・主要都市のプレフィックスパターン
+_PREF_PATTERN = re.compile(
+    r'^(東京|大阪|京都|北海道|神奈川|埼玉|千葉|愛知|兵庫|福岡|静岡|広島|宮城|新潟|長野|岐阜|栃木|群馬|茨城|福島|山形|秋田|岩手|青森|三重|滋賀|奈良|和歌山|鳥取|島根|岡山|山口|徳島|香川|愛媛|高知|佐賀|長崎|熊本|大分|宮崎|鹿児島|沖縄|横浜|名古屋|札幌|仙台|神戸|福島|渋谷|新宿|池袋|品川|秋葉原|上野|浅草|銀座|六本木|表参道)[のでにからまで]?'
+)
+
+def _extract_city_prefix(text):
+    """「東京の末広町」→ ('東京', '末広町') のように都市名と地名を分離"""
+    m = _PREF_PATTERN.match(text)
+    if m:
+        city = m.group(1)
+        place = text[m.end():].strip()
+        return city, place
+    return None, text
 
 
 PLACE_TYPE_MAP = {
@@ -1216,13 +1233,21 @@ async def on_message(message):
                 place_match = None  # キーワード抽出で参照するため先に初期化
 
                 # URLから取れなければ地名・駅名をジオコード
+                geocoded_label = None  # 確認メッセージ用
                 if lat is None:
+                    stripped = re.sub(r'近く|付近|周辺|現在地|営業中|今開いてる|バー|居酒屋|レストラン|カフェ|検索|探して', '', user_text)
                     place_match = re.search(
                         r'([ぁ-んァ-ヶー一-鿿]{1,10}[駅町市区村丁目]+|[ぁ-んァ-ヶー一-鿿]{2,8}(?:周辺|付近|エリア)?)',
-                        re.sub(r'近く|付近|周辺|現在地|営業中|今開いてる|バー|居酒屋|レストラン|カフェ|検索|探して', '', user_text)
+                        stripped
                     )
                     if place_match:
-                        lat, lng = await loop.run_in_executor(None, _geocode, place_match.group(1))
+                        raw_place = place_match.group(1)
+                        # 「東京の末広町」のように都市プレフィックスがあれば結合
+                        city_prefix, _ = _extract_city_prefix(
+                            re.sub(r'(の|で|に|から|まで).*', '', user_text.replace(raw_place, '').strip())
+                        )
+                        geocode_query = f"{city_prefix} {raw_place}" if city_prefix else raw_place
+                        lat, lng, geocoded_label = await loop.run_in_executor(None, _geocode, geocode_query)
 
                 # 現在地リンク方式（GPS）
                 if lat is None:
@@ -1254,6 +1279,10 @@ async def on_message(message):
                             f"例：「渋谷駅近くの今開いてるバー」"
                         )
                     return
+
+                # ジオコード結果を先に通知（場所の確認 → 違う場合は「東京の〇〇」と言い直せる）
+                if geocoded_label:
+                    await message.reply(f"{BOT_PREFIX}📍 **{geocoded_label}** で検索します。\n違う場合は「東京の〇〇」のように都市名を付けて言い直してください。")
 
                 # 検索キーワード抽出（地名を除いてから食べ物・施設を探す）
                 # ※ [一-鿿]{1,6} の漢字一括マッチは地名を誤って拾うため除去
