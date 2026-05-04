@@ -55,6 +55,8 @@ MEMO_LIST_KEYWORDS = ["メモ見せて", "メモ一覧", "メモを教えて", "
 RESERVATION_KEYWORDS = ["予約", "席を取って", "予約して", "予約したい", "ご予約", "席の予約"]
 TRAVEL_KEYWORDS = ["航空券", "飛行機", "ホテル", "宿", "ツアー", "旅行", "格安", "安いフライト", "旅館", "パック旅行", "ANA", "JAL", "LCC"]
 MAP_KEYWORDS = ["近く", "現在地", "付近", "周辺", "近い", "近くの", "今開いてる", "営業中", "地図", "マップ"]
+FOOD_KEYWORDS = ["ラーメン", "ラーメン屋", "寿司", "焼肉", "居酒屋", "カフェ", "レストラン", "うどん", "そば", "バー", "ランチ", "ディナー", "飲食店", "グルメ", "お店", "食べ物", "ご飯"]
+SEARCH_PHRASES = ["探して", "を探", "見つけて", "おすすめ", "教えて", "ある？", "ない？", "どこ"]
 # JARVISへのパス：PC操作・ローカル作業・明示的な指示
 JARVIS_KEYWORDS = ["JARVISに", "ジャービスに", "JARVISで", "jarvisに", "PCで", "PCの", "ファイルを", "フォルダを",
                    "RECONを", "スクリプトを", "ターミナルで", "ローカルで", "自動化して", "PCを起動", "PCを操作"]
@@ -432,6 +434,10 @@ def _detect_intent(text):
     # map_search: マップ系キーワードがあればURLなしでも検出
     if any(k in text for k in MAP_KEYWORDS):
         return "map_search"
+    # 食べ物＋検索フレーズ → map_search（「赤羽でラーメン探して」等）
+    if any(f in text for f in FOOD_KEYWORDS):
+        if any(s in text for s in SEARCH_PHRASES) or "写真" in text:
+            return "map_search"
     if any(k in text for k in REMINDER_KEYWORDS):
         return "reminder"
     # URLだけ、またはURL＋要約キーワードならクリッピング
@@ -1040,9 +1046,9 @@ async def on_message(message):
                     intent = "note_idea"
                 elif any(k in user_text for k in CARD_PRICE_KEYWORDS):
                     intent = "card_price"
-            # テキストのみで「写真」＋キャッシュあり → 写真リクエスト
+            # テキストのみで「写真」キーワード（食べ物系でなければ前回検索への参照とみなす）
             if not image_contents and intent == "chat":
-                if any(k in user_text for k in ["写真", "フォト", "画像"]) and channel_id in _last_places_cache:
+                if any(k in user_text for k in ["写真", "フォト"]) and not any(f in user_text for f in FOOD_KEYWORDS):
                     intent = "photo_request"
 
             # ── JARVIS ログ表示 ──
