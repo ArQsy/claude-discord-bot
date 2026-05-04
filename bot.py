@@ -585,10 +585,10 @@ def _nearby_search(lat, lng, keyword, radius=2000, open_now=False):
             }
             endpoint = "https://places.googleapis.com/v1/places:searchNearby"
         else:
-            # searchText: キーワード検索（searchNearbyはtextQueryを非対応）
+            # searchText: キーワード検索（locationRestrictionで範囲を厳密に絞る）
             body = {
                 "textQuery": keyword,
-                "locationBias": {
+                "locationRestriction": {
                     "circle": {"center": {"latitude": lat, "longitude": lng}, "radius": float(r)}
                 },
                 "maxResultCount": 20,
@@ -790,7 +790,7 @@ def split_message(text, limit=2000):
     return chunks
 
 
-async def _send_places_result(channel, places, lat, lng, keyword, radius, open_now, loop, reference=None):
+async def _send_places_result(channel, places, lat, lng, keyword, radius, open_now, loop, reference=None, location_name=None):
     """地図検索結果テキスト＋写真をDiscordに送信"""
     cid = str(channel.id)
     # メモリキャッシュ（即時）
@@ -807,7 +807,8 @@ async def _send_places_result(channel, places, lat, lng, keyword, radius, open_n
         print(f"写真名をDB保存: {len(photo_data)}件")
 
     open_label = "（営業中のみ）" if open_now else ""
-    header = f"📍 現在地から半径{radius}m以内の**{keyword}**{open_label}\n\n"
+    area = location_name if location_name else "現在地"
+    header = f"📍 {area}から半径{radius}mの**{keyword}**{open_label}\n\n"
     body = _format_places(places, lat, lng)
     send_kwargs = {"reference": reference} if reference else {}
     first = True
@@ -1303,7 +1304,7 @@ async def on_message(message):
                     await message.reply(f"{BOT_PREFIX}半径{radius}m以内に「{keyword}」は見つかりませんでした。範囲を広げるか別のキーワードをお試しください。")
                     return
 
-                await _send_places_result(message.channel, places, lat, lng, keyword, radius, open_now, loop, reference=message)
+                await _send_places_result(message.channel, places, lat, lng, keyword, radius, open_now, loop, reference=message, location_name=geocoded_label)
                 return
 
             # ── 旅行検索 ──
