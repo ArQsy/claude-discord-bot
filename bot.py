@@ -546,10 +546,8 @@ def _extract_city_prefix(text):
 
 
 PLACE_TYPE_MAP = {
+    # 施設タイプ（タイプ指定検索が有効なもの）
     'コンビニ': 'convenience_store',
-    'レストラン': 'restaurant',
-    '居酒屋': 'bar',
-    'バー': 'bar',
     'カフェ': 'cafe',
     'スーパー': 'supermarket',
     '薬局': 'pharmacy',
@@ -560,12 +558,12 @@ PLACE_TYPE_MAP = {
     '駐車場': 'parking',
     '銭湯': 'spa',
     'カラオケ': 'karaoke',
-    'ラーメン': 'restaurant',
-    '寿司': 'restaurant',
-    '焼肉': 'restaurant',
     'マック': 'meal_takeaway',
     'マクドナルド': 'meal_takeaway',
     'スタバ': 'cafe',
+    # 以下は意図的にマッピングしない（searchTextで名前検索する方が正確）
+    # ラーメン・寿司・焼肉・居酒屋・バー・レストランは
+    # 「restaurant」タイプだとマック等も含まれてしまうためキーワード検索を使う
 }
 
 
