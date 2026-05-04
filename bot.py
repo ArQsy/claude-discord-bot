@@ -44,12 +44,23 @@ anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 SYSTEM_PROMPT = """あなたは優秀なパーソナルアシスタントです。日本語で回答してください。
 ウェブ検索が必要な場合は検索ツールを使って最新情報を取得してください。
-コードの作業、情報収集、調査、雑談など何でも対応します。"""
+コードの作業、情報収集、調査、雑談など何でも対応します。
+
+【このBotが持つ機能】
+- リマインダー設定（「〇月〇日〇時にリマインドして」「〇日の夜にお知らせして」等）
+- メモ保存・一覧表示
+- 周辺スポット検索（Google Maps連携）
+- 旅行・航空券検索
+- レストラン予約サポート
+- ボイスメッセージの文字起こし
+- 画像認識・分析
+
+リマインダーや通知に関する質問には「できない」と答えず、上記機能を案内してください。"""
 
 HISTORY_LIMIT = 40
 BOT_PREFIX = "**【アシスタント】**\n"
 
-REMINDER_KEYWORDS = ["リマインド", "reminder", "通知して", "忘れないように", "教えて", "アラーム"]
+REMINDER_KEYWORDS = ["リマインド", "reminder", "通知して", "忘れないように", "アラーム", "お知らせして", "知らせて", "忘れずに", "忘れないで", "教えてほしい", "声かけて", "声をかけて"]
 MEMO_SAVE_KEYWORDS = ["メモして", "メモ：", "メモ:", "覚えておいて", "記録して", "メモ保存"]
 MEMO_LIST_KEYWORDS = ["メモ見せて", "メモ一覧", "メモを教えて", "メモ確認", "メモリスト"]
 RESERVATION_KEYWORDS = ["予約", "席を取って", "予約して", "予約したい", "ご予約", "席の予約"]
@@ -453,12 +464,17 @@ def _parse_reminder(text):
     now_jst = datetime.now(JST).strftime("%Y年%m月%d日 %H:%M")
     response = anthropic_client.messages.create(
         model="claude-haiku-4-5",
-        max_tokens=200,
+        max_tokens=300,
         system=f"""現在の日時（JST）: {now_jst}
 ユーザーのメッセージからリマインダーの日時と内容を抽出してください。
 必ずJSON形式のみで返してください（説明文は不要）:
 {{"remind_at": "YYYY-MM-DDTHH:MM:SS", "message": "リマインダー内容"}}
-日時が不明な場合: {{"error": "日時が不明です"}}""",
+
+ルール:
+- 「夜」=21:00、「朝」=08:00、「昼」=12:00 として扱う
+- 「〇日前」「〇日の前日」は指定日の前日21:00とする
+- 年が省略された場合は{datetime.now(JST).year}年とする（過去日なら翌年）
+- 日時が完全に不明な場合のみ: {{"error": "日時が不明です"}}""",
         messages=[{"role": "user", "content": text}]
     )
     raw = response.content[0].text.strip()
@@ -1209,7 +1225,11 @@ async def on_message(message):
                 try:
                     parsed = await loop.run_in_executor(None, _parse_reminder, user_text)
                     if "error" in parsed:
-                        await message.reply(f"{BOT_PREFIX}⚠️ 日時が読み取れませんでした。「5月10日の15時にリマインドして」のように教えてください。")
+                        await message.reply(
+                            f"{BOT_PREFIX}⚠️ 日時が特定できませんでした。\n"
+                            f"具体的な日時を指定してください。\n"
+                            f"例：「5月14日の夜にお知らせして」「6月1日12時にリマインドして」"
+                        )
                         return
                     remind_at_jst = datetime.fromisoformat(parsed["remind_at"]).replace(tzinfo=JST)
                     remind_at_utc = remind_at_jst.astimezone(timezone.utc).replace(tzinfo=None)
