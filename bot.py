@@ -1,5 +1,6 @@
 import os
 import re
+import io
 import json
 import math
 import uuid
@@ -448,7 +449,7 @@ PLACE_TYPE_MAP = {
 def _nearby_search(lat, lng, keyword, radius=2000, open_now=False):
     """Places API (New) で周辺スポットを検索"""
     place_type = PLACE_TYPE_MAP.get(keyword)
-    field_mask = "places.id,places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.location,places.regularOpeningHours"
+    field_mask = "places.id,places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.location,places.regularOpeningHours,places.photos"
 
     def _search(r):
         if place_type:
@@ -530,6 +531,27 @@ def _format_places(places, lat, lng, limit=8):
     return "\n\n".join(lines)
 
 
+def _fetch_place_photos_sync(places, limit=3):
+    """上位limit件の写真をダウンロード。(店名, バイト列) のリストを返す"""
+    result = []
+    for p in places[:limit]:
+        photos = p.get("photos", [])
+        if not photos:
+            continue
+        photo_name = photos[0].get("name", "")
+        if not photo_name:
+            continue
+        url = f"https://places.googleapis.com/v1/{photo_name}/media?maxWidthPx=800&key={GOOGLE_MAPS_API_KEY}"
+        try:
+            resp = requests.get(url, timeout=10, allow_redirects=True)
+            if resp.status_code == 200 and resp.content:
+                name = p.get("displayName", {}).get("text", "店舗")
+                result.append((name, resp.content))
+        except Exception as e:
+            print(f"写真取得失敗 ({p.get('displayName', {}).get('text', '')}): {e}")
+    return result
+
+
 def _transcribe_sync(audio_bytes, suffix='.ogg'):
     # AquaVoice APIが設定されていればそちらを優先
     if AQUAVOICE_API_KEY:
@@ -596,6 +618,26 @@ def split_message(text, limit=2000):
         chunks.append(text[:split_at])
         text = text[split_at:].lstrip('\n')
     return chunks
+
+
+async def _send_places_result(channel, places, lat, lng, keyword, radius, open_now, loop, reference=None):
+    """地図検索結果テキスト＋写真をDiscordに送信"""
+    open_label = "（営業中のみ）" if open_now else ""
+    header = f"📍 現在地から半径{radius}m以内の**{keyword}**{open_label}\n\n"
+    body = _format_places(places, lat, lng)
+    send_kwargs = {"reference": reference} if reference else {}
+    first = True
+    for chunk in split_message(BOT_PREFIX + header + body):
+        await channel.send(chunk, **(send_kwargs if first else {}))
+        first = False
+
+    # 上位3件の写真を取得して送信
+    photos = await loop.run_in_executor(None, _fetch_place_photos_sync, places, 3)
+    if photos:
+        files = [discord.File(io.BytesIO(data), filename=f"photo_{i+1}.jpg")
+                 for i, (_, data) in enumerate(photos)]
+        caption = "📸 " + " / ".join(name for name, _ in photos)
+        await channel.send(caption, files=files)
 
 
 # ───────────── バックグラウンド: リマインダーチェック ─────────────
@@ -694,11 +736,8 @@ async def handle_location_submit(request):
         if not places:
             await channel.send(f"{BOT_PREFIX}半径{radius}m以内に「{keyword}」は見つかりませんでした。")
         else:
-            open_label = "（営業中のみ）" if open_now else ""
-            header = f"📍 現在地から半径{radius}m以内の**{keyword}**{open_label}\n\n"
-            body = _format_places(places, lat, lng)
-            for chunk in split_message(BOT_PREFIX + header + body):
-                await channel.send(chunk)
+            ev_loop = asyncio.get_running_loop()
+            await _send_places_result(channel, places, lat, lng, keyword, radius, open_now, ev_loop)
 
         return web.Response(text='OK')
     except Exception as e:
@@ -1009,11 +1048,7 @@ async def on_message(message):
                     await message.reply(f"{BOT_PREFIX}半径{radius}m以内に「{keyword}」は見つかりませんでした。範囲を広げるか別のキーワードをお試しください。")
                     return
 
-                body = _format_places(places, lat, lng)
-                open_label = "（営業中のみ）" if open_now else ""
-                header = f"📍 現在地から半径{radius}m以内の**{keyword}**{open_label}\n\n"
-                for chunk in split_message(BOT_PREFIX + header + body):
-                    await message.reply(chunk)
+                await _send_places_result(message.channel, places, lat, lng, keyword, radius, open_now, loop, reference=message)
                 return
 
             # ── 旅行検索 ──
