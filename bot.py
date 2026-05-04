@@ -625,41 +625,73 @@ def _format_places(places, lat, lng, limit=8):
     return "\n\n".join(lines)
 
 
-def _fetch_place_photos_sync(places, limit=3):
-    """上位limit件の写真をダウンロード。(店名, バイト列) のリストを返す"""
+def _fetch_photo_by_name(photo_name: str) -> bytes | None:
+    """photo_nameから画像バイト列を取得。2方式でフォールバック"""
+    base_url = f"https://places.googleapis.com/v1/{photo_name}/media?maxWidthPx=800"
+    # 方式①: skipHttpRedirect=true でphotoUriを取得
+    try:
+        meta = requests.get(
+            base_url + f"&skipHttpRedirect=true&key={GOOGLE_MAPS_API_KEY}",
+            timeout=10
+        )
+        print(f"    [方式①] status={meta.status_code}")
+        if meta.status_code == 200:
+            body = meta.json()
+            photo_uri = body.get("photoUri") or body.get("photo_uri", "")
+            print(f"    photoUri={photo_uri[:60] if photo_uri else 'なし'} keys={list(body.keys())}")
+            if photo_uri:
+                img = requests.get(photo_uri, timeout=15)
+                print(f"    画像DL: status={img.status_code} size={len(img.content)}")
+                if img.status_code == 200 and len(img.content) > 1000:
+                    return img.content
+    except Exception as e:
+        print(f"    [方式①] 例外: {e}")
+    # 方式②: 直接リダイレクト追跡
+    try:
+        img = requests.get(
+            base_url + f"&key={GOOGLE_MAPS_API_KEY}",
+            timeout=15,
+            allow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        print(f"    [方式②] status={img.status_code} ct={img.headers.get('content-type','')} size={len(img.content)}")
+        if img.status_code == 200 and len(img.content) > 1000:
+            return img.content
+    except Exception as e:
+        print(f"    [方式②] 例外: {e}")
+    return None
+
+
+def _fetch_place_photos_sync(places_or_photo_data, limit=3):
+    """写真データリスト [(店名, photo_name), ...] またはplacesリストから画像を取得"""
     result = []
-    for p in places[:limit]:
+    # photo_dataリスト形式 [(name, photo_name), ...]
+    if places_or_photo_data and isinstance(places_or_photo_data[0], (list, tuple)) and isinstance(places_or_photo_data[0][-1], str) and not isinstance(places_or_photo_data[0][0], dict):
+        items = places_or_photo_data[:limit]
+        for entry in items:
+            name, photo_name = entry[0], entry[1]
+            print(f"写真取得: {name} / {photo_name[:50]}")
+            data = _fetch_photo_by_name(photo_name)
+            if data:
+                result.append((name, data))
+        return result
+    # placesリスト形式
+    places = places_or_photo_data
+    with_photos = [(p, p.get("photos", [])) for p in places[:limit]]
+    print(f"写真フィールドあり: {sum(1 for _, ph in with_photos if ph)}/{len(with_photos)}件")
+    for p, photos in with_photos:
         name = p.get("displayName", {}).get("text", "店舗")
-        photos = p.get("photos", [])
         if not photos:
-            print(f"写真フィールドなし: {name}")
+            print(f"  写真なし: {name}")
             continue
         photo_name = photos[0].get("name", "")
         if not photo_name:
-            print(f"photo_name空: {name}")
+            print(f"  photo_name空: {name}")
             continue
-        print(f"写真取得試行: {name} / {photo_name[:60]}")
-        # skipHttpRedirect=true でphotoUriを先取得→画像DL の2ステップ方式
-        meta_url = (
-            f"https://places.googleapis.com/v1/{photo_name}/media"
-            f"?maxWidthPx=800&skipHttpRedirect=true&key={GOOGLE_MAPS_API_KEY}"
-        )
-        try:
-            meta = requests.get(meta_url, timeout=10)
-            print(f"  メタ: status={meta.status_code}")
-            if meta.status_code != 200:
-                print(f"  メタ失敗: {meta.text[:120]}")
-                continue
-            photo_uri = meta.json().get("photoUri", "")
-            if not photo_uri:
-                print(f"  photoUri未取得: {meta.text[:120]}")
-                continue
-            img = requests.get(photo_uri, timeout=15)
-            print(f"  画像: status={img.status_code} ct={img.headers.get('content-type','')}")
-            if img.status_code == 200 and img.content:
-                result.append((name, img.content))
-        except Exception as e:
-            print(f"写真取得例外 ({name}): {e}")
+        print(f"写真取得: {name} / {photo_name[:50]}")
+        data = _fetch_photo_by_name(photo_name)
+        if data:
+            result.append((name, data))
     return result
 
 
@@ -733,8 +765,19 @@ def split_message(text, limit=2000):
 
 async def _send_places_result(channel, places, lat, lng, keyword, radius, open_now, loop, reference=None):
     """地図検索結果テキスト＋写真をDiscordに送信"""
-    # 後から写真リクエストできるようキャッシュ保存
-    _last_places_cache[str(channel.id)] = (places, lat, lng)
+    cid = str(channel.id)
+    # メモリキャッシュ（即時）
+    _last_places_cache[cid] = (places, lat, lng)
+    # DB永続保存（再起動後も利用可能）
+    photo_data = []
+    for p in places[:3]:
+        pname = p.get("displayName", {}).get("text", "店舗")
+        ph = p.get("photos", [])
+        if ph and ph[0].get("name"):
+            photo_data.append([pname, ph[0]["name"]])
+    if photo_data:
+        await loop.run_in_executor(None, _jarvis_memory_save, f"photos_{cid}", json.dumps(photo_data, ensure_ascii=False))
+        print(f"写真名をDB保存: {len(photo_data)}件")
 
     open_label = "（営業中のみ）" if open_now else ""
     header = f"📍 現在地から半径{radius}m以内の**{keyword}**{open_label}\n\n"
@@ -1257,17 +1300,32 @@ async def on_message(message):
                     await message.reply(chunk)
                 return
 
-            # ── 写真リクエスト（直前の検索キャッシュから） ──
+            # ── 写真リクエスト（キャッシュ or DB永続データから） ──
             if intent == "photo_request":
-                cache = _last_places_cache.get(channel_id)
-                if not cache:
-                    await message.reply(f"{BOT_PREFIX}直前の検索結果が見つかりません。先に周辺スポットを検索してください。")
-                    return
-                places_cached, lat_c, lng_c = cache
                 await message.reply(f"{BOT_PREFIX}📸 写真を取得しています…")
-                photos = await loop.run_in_executor(None, _fetch_place_photos_sync, places_cached, 3)
+                photos = []
+                # ①メモリキャッシュ
+                cache = _last_places_cache.get(channel_id)
+                if cache:
+                    places_cached, _, _ = cache
+                    photos = await loop.run_in_executor(None, _fetch_place_photos_sync, places_cached, 3)
+                # ②DB永続データ（再起動後フォールバック）
                 if not photos:
-                    await message.reply(f"{BOT_PREFIX}写真を取得できませんでした（Places APIに写真データがない可能性があります）。")
+                    def _load_photo_data():
+                        rows = _jarvis_memory_list()
+                        for k, v in rows:
+                            if k == f"photos_{channel_id}":
+                                try:
+                                    return json.loads(v)
+                                except Exception:
+                                    return []
+                        return []
+                    photo_data = await loop.run_in_executor(None, _load_photo_data)
+                    if photo_data:
+                        print(f"DBから写真データ読込: {len(photo_data)}件")
+                        photos = await loop.run_in_executor(None, _fetch_place_photos_sync, photo_data, 3)
+                if not photos:
+                    await message.reply(f"{BOT_PREFIX}写真を取得できませんでした。先に周辺検索を行ってください。")
                     return
                 files = [discord.File(io.BytesIO(data), filename=f"photo_{i+1}.jpg")
                          for i, (_, data) in enumerate(photos)]
