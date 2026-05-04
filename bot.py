@@ -1213,6 +1213,7 @@ async def on_message(message):
                     return
 
                 lat, lng = await loop.run_in_executor(None, _extract_coords, user_text)
+                place_match = None  # キーワード抽出で参照するため先に初期化
 
                 # URLから取れなければ地名・駅名をジオコード
                 if lat is None:
