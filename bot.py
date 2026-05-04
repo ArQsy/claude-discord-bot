@@ -58,6 +58,8 @@ JARVIS_KEYWORDS = ["JARVISに", "ジャービスに", "JARVISで", "jarvisに", 
 JARVIS_MEMORY_SAVE_KEYWORDS = ["JARVIS記憶して", "JARVISに覚えさせて", "JARVIS覚えて"]
 JARVIS_MEMORY_LIST_KEYWORDS = ["JARVISの記憶", "JARVIS記憶一覧", "JARVISが覚えてること"]
 JARVIS_LOG_KEYWORDS = ["JARVISのログ", "JARVISの会話履歴", "JARVISと何を話した"]
+PROPOSAL_KEYWORDS = ["提案:", "提案：", "クロードに:", "クロードに：", "Claudeに:", "Claudeに：", "提案メモ"]
+PROPOSAL_LIST_KEYWORDS = ["提案一覧", "提案リスト", "Claudeへの提案"]
 
 TRAVEL_SYSTEM_PROMPT = """あなたは旅行・交通のお得情報を探すアシスタントです。
 ユーザーの条件（出発地・目的地・日程・人数・予算）を整理し、ウェブ検索で最安値に近い選択肢を見つけてください。
@@ -162,6 +164,15 @@ def _init_db():
                     created_at TIMESTAMP DEFAULT NOW()
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS claude_proposals (
+                    id SERIAL PRIMARY KEY,
+                    username TEXT,
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    status TEXT DEFAULT 'pending'
+                )
+            """)
         conn.commit()
 
 
@@ -239,6 +250,28 @@ def _save_memo(channel_id, user_id, username, content):
                 (channel_id, user_id, username, content)
             )
         conn.commit()
+
+
+def _save_proposal(username: str, content: str) -> None:
+    with _get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO claude_proposals (username, content) VALUES (%s, %s)",
+                (username, content)
+            )
+        conn.commit()
+
+
+def _get_proposals(limit=10):
+    with _get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute("""
+                SELECT id, username, content, created_at FROM claude_proposals
+                WHERE status = 'pending'
+                ORDER BY created_at ASC
+                LIMIT %s
+            """, (limit,))
+            return cur.fetchall()
 
 
 def _get_memos(channel_id, limit=10):
@@ -331,6 +364,10 @@ def _detect_intent(text):
         return "jarvis_memory_save"
     if any(k in text for k in JARVIS_KEYWORDS):
         return "jarvis_task"
+    if any(k in text for k in PROPOSAL_LIST_KEYWORDS):
+        return "claude_proposal_list"
+    if any(k in text for k in PROPOSAL_KEYWORDS):
+        return "claude_proposal"
     if any(k in text for k in MEMO_LIST_KEYWORDS):
         return "memo_list"
     if any(k in text for k in MEMO_SAVE_KEYWORDS):
@@ -938,6 +975,43 @@ async def on_message(message):
                                 )
                         return
                 await message.reply(f"{BOT_PREFIX}⏳ JARVISが応答しませんでした（60秒タイムアウト）。PCが起動しているか確認してください。")
+                return
+
+            # ── Claude提案一覧 ──
+            if intent == "claude_proposal_list":
+                rows = await loop.run_in_executor(None, _get_proposals)
+                if not rows:
+                    await message.reply(f"{BOT_PREFIX}📋 まだ提案はありません。")
+                    return
+                lines = []
+                for i, r in enumerate(rows, 1):
+                    jst_time = r['created_at'].replace(tzinfo=timezone.utc).astimezone(JST)
+                    lines.append(f"**{i}.** [{jst_time.strftime('%-m/%-d %H:%M')}] {r['content']}")
+                await message.reply(f"{BOT_PREFIX}📋 **Claudeへの提案一覧**\n" + "\n".join(lines))
+                return
+
+            # ── Claude提案保存 ──
+            if intent == "claude_proposal":
+                content = user_text
+                for kw in PROPOSAL_KEYWORDS:
+                    content = content.replace(kw, "").strip()
+                content = content.lstrip("：:").strip()
+                if not content:
+                    await message.reply(f"{BOT_PREFIX}提案内容を書いてください。\n例：「提案: 検索結果に評価フィルターを追加してほしい」")
+                    return
+                await loop.run_in_executor(None, _save_proposal, str(message.author), content)
+                # JARVISにファイル追記を依頼（fire-and-forget）
+                now_str = datetime.now(JST).strftime('%Y/%m/%d %H:%M')
+                file_task = (
+                    f"C:\\Users\\makur\\claude-proposals.md というファイルに以下の1行を追記してください"
+                    f"（ファイルがなければ新規作成）:\n- [{now_str}] {content}"
+                )
+                await loop.run_in_executor(None, _jarvis_enqueue, file_task, channel_id, False)
+                await message.reply(
+                    f"{BOT_PREFIX}✅ Claudeへの提案を送りました！\n"
+                    f"📝 {content}\n"
+                    f"💾 DBに保存済み・PCが起動中ならファイルにも書き込まれます"
+                )
                 return
 
             # ── メモ一覧 ──
