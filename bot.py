@@ -626,24 +626,37 @@ def _fetch_place_photos_sync(places, limit=3):
     """上位limit件の写真をダウンロード。(店名, バイト列) のリストを返す"""
     result = []
     for p in places[:limit]:
+        name = p.get("displayName", {}).get("text", "店舗")
         photos = p.get("photos", [])
         if not photos:
+            print(f"写真フィールドなし: {name}")
             continue
         photo_name = photos[0].get("name", "")
         if not photo_name:
+            print(f"photo_name空: {name}")
             continue
-        url = f"https://places.googleapis.com/v1/{photo_name}/media?maxWidthPx=800&key={GOOGLE_MAPS_API_KEY}"
+        print(f"写真取得試行: {name} / {photo_name[:60]}")
+        # skipHttpRedirect=true でphotoUriを先取得→画像DL の2ステップ方式
+        meta_url = (
+            f"https://places.googleapis.com/v1/{photo_name}/media"
+            f"?maxWidthPx=800&skipHttpRedirect=true&key={GOOGLE_MAPS_API_KEY}"
+        )
         try:
-            resp = requests.get(url, timeout=10, allow_redirects=True)
-            if (resp.status_code == 200
-                    and resp.content
-                    and resp.headers.get('content-type', '').startswith('image/')):
-                name = p.get("displayName", {}).get("text", "店舗")
-                result.append((name, resp.content))
-            elif resp.status_code != 200:
-                print(f"写真取得失敗 ({p.get('displayName', {}).get('text', '')}): status={resp.status_code}")
+            meta = requests.get(meta_url, timeout=10)
+            print(f"  メタ: status={meta.status_code}")
+            if meta.status_code != 200:
+                print(f"  メタ失敗: {meta.text[:120]}")
+                continue
+            photo_uri = meta.json().get("photoUri", "")
+            if not photo_uri:
+                print(f"  photoUri未取得: {meta.text[:120]}")
+                continue
+            img = requests.get(photo_uri, timeout=15)
+            print(f"  画像: status={img.status_code} ct={img.headers.get('content-type','')}")
+            if img.status_code == 200 and img.content:
+                result.append((name, img.content))
         except Exception as e:
-            print(f"写真取得失敗 ({p.get('displayName', {}).get('text', '')}): {e}")
+            print(f"写真取得例外 ({name}): {e}")
     return result
 
 
