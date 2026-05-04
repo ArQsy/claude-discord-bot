@@ -473,14 +473,33 @@ def _parse_reminder(text):
 ルール:
 - 「夜」=21:00、「朝」=08:00、「昼」=12:00 として扱う
 - 「〇日前」「〇日の前日」は指定日の前日21:00とする
+- 「〇分前」「〇時間前」は指定日時からその分/時間を引いた時刻にする
 - 年が省略された場合は{datetime.now(JST).year}年とする（過去日なら翌年）
+- ページの内容が含まれている場合はそこから日時を読み取ること
 - 日時が完全に不明な場合のみ: {{"error": "日時が不明です"}}""",
         messages=[{"role": "user", "content": text}]
     )
     raw = response.content[0].text.strip()
-    # コードブロックで囲まれている場合に除去
     raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw, flags=re.MULTILINE).strip()
     return json.loads(raw)
+
+
+def _fetch_page_datetime(url: str) -> str:
+    """URLのページから日時情報を抽出して返す"""
+    try:
+        response = anthropic_client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=400,
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}],
+            messages=[{"role": "user", "content":
+                f"このURLのページを確認して、発売日時・開始日時・イベント日時・販売開始時間など"
+                f"日程に関する情報を全て抽出してください。日時の数字を正確に: {url}"}]
+        )
+        text = "".join(b.text for b in response.content if hasattr(b, 'text'))
+        return text.strip()
+    except Exception as e:
+        print(f"ページ日時取得エラー: {e}")
+        return ""
 
 
 # ───────────── ユーティリティ ─────────────
@@ -1223,7 +1242,19 @@ async def on_message(message):
             # ── リマインダー ──
             if intent == "reminder":
                 try:
-                    parsed = await loop.run_in_executor(None, _parse_reminder, user_text)
+                    # URLがあればページから日時情報を取得してコンテキストに追加
+                    url_in_msg = re.search(r'https?://\S+', user_text)
+                    reminder_input = user_text
+                    if url_in_msg:
+                        await message.reply(f"{BOT_PREFIX}🔍 ページを確認しています...")
+                        page_info = await loop.run_in_executor(None, _fetch_page_datetime, url_in_msg.group(0))
+                        if page_info:
+                            reminder_input = (
+                                f"ユーザーの指示: {user_text}\n\n"
+                                f"【ページから取得した日時情報】\n{page_info}"
+                            )
+
+                    parsed = await loop.run_in_executor(None, _parse_reminder, reminder_input)
                     if "error" in parsed:
                         await message.reply(
                             f"{BOT_PREFIX}⚠️ 日時が特定できませんでした。\n"
