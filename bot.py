@@ -1511,6 +1511,35 @@ async def on_message(message):
             # ── ポケカ相場チェック（写真→価格検索） ──
             if intent == "card_price":
                 user_content = image_contents + ([{"type": "text", "text": user_text}] if user_text else [{"type": "text", "text": "このポケモンカードの現在の相場を調べてください。"}])
+
+                # 画像あり: 2ステップフロー（Haiku識別 → Sonnet価格検索）
+                if image_contents:
+                    await message.reply(f"{BOT_PREFIX}🔍 カードを識別しています...")
+                    card_info = await loop.run_in_executor(None, _identify_card, image_contents)
+                    grade = card_info.get("grade", "")
+                    card_name = card_info.get("card_name", "")
+
+                    if "error" not in card_info and card_name and any(g in grade.upper() for g in ["PSA", "BGS", "CGC"]):
+                        # PSA/BGS/CGC グレード確認 → 専用価格検索
+                        set_name = card_info.get("set_name", "")
+                        display_name = f"{card_name}（{set_name}）" if set_name else card_name
+                        search_prompt = f"{display_name} {grade} の直近の取引価格をメルカリ・スニダン・eBayで調べてください。"
+
+                        def _call_psa_price():
+                            return anthropic_client.messages.create(
+                                model="claude-sonnet-4-6",
+                                max_tokens=1200,
+                                system=PSA_PRICE_SYSTEM_PROMPT,
+                                tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
+                                messages=[{"role": "user", "content": search_prompt}],
+                            )
+                        response = await loop.run_in_executor(None, _call_psa_price)
+                        reply_text = next((b.text for b in response.content if hasattr(b, 'text')), "価格情報が見つかりませんでした。カード名を直接テキストで教えてください。")
+                        for chunk in split_message(BOT_PREFIX + reply_text):
+                            await message.reply(chunk)
+                        return
+
+                # グレードなし or 識別失敗 → 既存フロー（web_search で一般検索）
                 def _call_card_price():
                     return anthropic_client.messages.create(
                         model="claude-sonnet-4-6",
