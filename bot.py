@@ -885,6 +885,107 @@ def split_message(text, limit=2000):
     return chunks
 
 
+def _decode_qr_cert(image_bytes: bytes) -> str | None:
+    """画像からPSA QRコードを解読してCert番号を返す"""
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        results = zxingcpp.read_barcodes(img)
+        for result in results:
+            text = result.text
+            m = re.search(r'psacard\.com/cert/(\d+)', text, re.IGNORECASE)
+            if m:
+                return m.group(1)
+            if re.match(r'^\d{6,12}$', text.strip()):
+                return text.strip()
+    except Exception as e:
+        print(f"QR解読エラー: {e}")
+    return None
+
+
+def _ocr_cert_number(image_contents: list) -> str | None:
+    """Haiku でスラブ画像からCert番号をOCR読み取りする"""
+    try:
+        response = anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=50,
+            system=CERT_OCR_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": image_contents + [{"type": "text", "text": "このスラブのCert番号を教えてください。"}]}],
+        )
+        text = response.content[0].text.strip()
+        m = re.search(r'\d{6,12}', text)
+        if m:
+            return m.group(0)
+    except Exception as e:
+        print(f"Cert番号OCRエラー: {e}")
+    return None
+
+
+def _psa_get_token() -> str | None:
+    """PSA公開APIのOAuth2トークンを取得・キャッシュして返す"""
+    global _psa_token, _psa_token_expires
+    if _psa_token and time.time() < _psa_token_expires - 60:
+        return _psa_token
+    if not PSA_USERNAME or not PSA_PASSWORD:
+        return None
+    try:
+        resp = requests.post(
+            'https://api.psacard.com/publicapi/token',
+            data={
+                'grant_type': 'password',
+                'username': PSA_USERNAME,
+                'password': PSA_PASSWORD,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        _psa_token = data['access_token']
+        _psa_token_expires = time.time() + data.get('expires_in', 3600)
+        print(f"PSAトークン取得成功")
+        return _psa_token
+    except Exception as e:
+        print(f"PSAトークン取得エラー: {e}")
+        return None
+
+
+def _psa_lookup_cert(cert_number: str) -> dict:
+    """PSA公開APIでCert番号からカード情報を取得する"""
+    token = _psa_get_token()
+    if not token:
+        return {"error": "PSA APIトークンが取得できませんでした"}
+    try:
+        resp = requests.get(
+            f'https://api.psacard.com/publicapi/cert/GetByCertNumber/{cert_number}',
+            headers={'Authorization': f'bearer {token}'},
+            timeout=15,
+        )
+        if resp.status_code == 401:
+            global _psa_token
+            _psa_token = None
+            return {"error": "PSA APIトークン期限切れ"}
+        resp.raise_for_status()
+        data = resp.json()
+        if not data.get('IsValidRequest'):
+            return {"error": data.get('ServerMessage', '照会失敗')}
+        cert = data.get('PSACert', {})
+        subject = cert.get('Subject', '')
+        variety = cert.get('Variety', '')
+        card_name = f"{subject} {variety}".strip() if variety else subject
+        brand = cert.get('Brand', '')
+        year = cert.get('Year', '')
+        set_name = f"{brand} {year}".strip() if year else brand
+        grade_num = cert.get('PSAGrade', '')
+        return {
+            'card_name': card_name,
+            'set_name': set_name,
+            'grade': f'PSA{grade_num}',
+            'cert_number': cert_number,
+        }
+    except Exception as e:
+        print(f"PSA API照会エラー: {e}")
+        return {"error": str(e)}
+
+
 def _identify_card(image_contents: list) -> dict:
     """Haiku + Vision で画像からカード情報を識別する。同期関数（executor経由で呼ぶ）"""
     try:
