@@ -1004,13 +1004,10 @@ def _identify_card(image_contents: list) -> dict:
         if cert_number:
             print(f"OCRでCert番号取得: {cert_number}")
 
-    # Step 3: Cert番号があればPSA API照会
+    # Step 3: Cert番号があればそのまま返す（web_searchで照会させる）
     if cert_number:
-        result = _psa_lookup_cert(cert_number)
-        if "error" not in result:
-            print(f"PSA API照会成功: {result}")
-            return result
-        print(f"PSA API照会失敗: {result.get('error')} → Claudeフォールバック")
+        print(f"Cert番号確定: {cert_number} → web_searchで照会")
+        return {"cert_number": cert_number, "grade": "PSA", "card_name": "", "set_name": ""}
 
     # Step 4: Claudeでカード識別（フォールバック）
     try:
@@ -1663,12 +1660,21 @@ async def on_message(message):
                     grade = card_info.get("grade", "")
                     card_name = card_info.get("card_name", "")
 
-                    if "error" not in card_info and card_name and any(g in grade.upper() for g in ["PSA", "BGS", "CGC"]):
-                        # PSA/BGS/CGC グレード確認 → 専用価格検索
+                    cert_number = card_info.get("cert_number")
+                    if cert_number:
+                        # QR/OCRでCert番号取得済み → Cert番号でそのまま照会
+                        await message.reply(f"{BOT_PREFIX}💰 PSA Cert **{cert_number}** の価格をメルカリ・スニダン・eBayで検索しています...")
+                        search_prompt = f"PSA Cert番号 {cert_number} のポケモンカードを特定して、メルカリ・スニダン・eBayの直近の取引価格（売り切れ実績）を調べてください。"
+                    elif "error" not in card_info and card_name and any(g in grade.upper() for g in ["PSA", "BGS", "CGC"]):
+                        # Claude Visionで識別済み → カード名でそのまま照会
                         set_name = card_info.get("set_name", "")
                         display_name = f"{card_name}（{set_name}）" if set_name else card_name
                         await message.reply(f"{BOT_PREFIX}💰 **{display_name} {grade}** の価格をメルカリ・スニダン・eBayで検索しています...")
                         search_prompt = f"{display_name} {grade} の直近の取引価格をメルカリ・スニダン・eBayで調べてください。"
+                    else:
+                        search_prompt = None
+
+                    if search_prompt:
 
                         def _call_psa_price():
                             return anthropic_client.messages.create(
