@@ -987,7 +987,32 @@ def _psa_lookup_cert(cert_number: str) -> dict:
 
 
 def _identify_card(image_contents: list) -> dict:
-    """Haiku + Vision で画像からカード情報を識別する。同期関数（executor経由で呼ぶ）"""
+    """ハイブリッド識別: QR解読 → Cert OCR → PSA API → Claudeフォールバック"""
+    # Step 1: QRコードからCert番号を取得
+    cert_number = None
+    for ic in image_contents:
+        if ic.get("type") == "image" and ic.get("source", {}).get("type") == "base64":
+            img_bytes = base64.standard_b64decode(ic["source"]["data"])
+            cert_number = _decode_qr_cert(img_bytes)
+            if cert_number:
+                print(f"QRコードからCert番号取得: {cert_number}")
+                break
+
+    # Step 2: QRで取れなければHaikuでOCR
+    if not cert_number:
+        cert_number = _ocr_cert_number(image_contents)
+        if cert_number:
+            print(f"OCRでCert番号取得: {cert_number}")
+
+    # Step 3: Cert番号があればPSA API照会
+    if cert_number:
+        result = _psa_lookup_cert(cert_number)
+        if "error" not in result:
+            print(f"PSA API照会成功: {result}")
+            return result
+        print(f"PSA API照会失敗: {result.get('error')} → Claudeフォールバック")
+
+    # Step 4: Claudeでカード識別（フォールバック）
     try:
         response = anthropic_client.messages.create(
             model="claude-haiku-4-5-20251001",
