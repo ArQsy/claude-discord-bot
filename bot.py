@@ -987,11 +987,9 @@ def _identify_card(image_contents: list) -> dict:
             if "error" not in result:
                 print(f"PSA API照会成功: {result}")
                 return result
-            print(f"PSA API照会失敗: {result.get('error')} → Cert番号フォールバック")
-        print(f"Cert番号確定: {cert_number} → web_searchで照会")
-        return {"cert_number": cert_number, "grade": "PSA", "card_name": "", "set_name": ""}
+            print(f"PSA API照会失敗: {result.get('error')} → Claude Visionフォールバック")
 
-    # Step 4: Claudeでカード識別（フォールバック）
+    # Step 4: Claude Vision でラベルを直接読む（PSA API不要・常に動作）
     try:
         response = anthropic_client.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -1001,9 +999,15 @@ def _identify_card(image_contents: list) -> dict:
         )
         raw = response.content[0].text.strip()
         raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw, flags=re.MULTILINE).strip()
-        return json.loads(raw)
+        result = json.loads(raw)
+        if cert_number and "error" not in result:
+            result["cert_number"] = cert_number
+        print(f"Claude Vision識別結果: {result}")
+        return result
     except Exception as e:
         print(f"カード識別エラー: {e}")
+        if cert_number:
+            return {"cert_number": cert_number, "grade": "PSA", "card_name": "", "set_name": ""}
         return {"error": str(e)}
 
 
@@ -1643,16 +1647,17 @@ async def on_message(message):
                     card_name = card_info.get("card_name", "")
 
                     cert_number = card_info.get("cert_number")
-                    if cert_number:
-                        # QR/OCRでCert番号取得済み → Cert番号でそのまま照会
-                        await message.reply(f"{BOT_PREFIX}💰 PSA Cert **{cert_number}** の価格をメルカリ・スニダン・eBayで検索しています...")
-                        search_prompt = f"PSA Cert番号 {cert_number} のポケモンカードを特定して、メルカリ・スニダン・eBayの直近の取引価格（売り切れ実績）を調べてください。"
-                    elif "error" not in card_info and card_name and any(g in grade.upper() for g in ["PSA", "BGS", "CGC"]):
-                        # Claude Visionで識別済み → カード名でそのまま照会
+                    if "error" not in card_info and card_name and any(g in grade.upper() for g in ["PSA", "BGS", "CGC"]):
+                        # カード名が判明 → カード名で検索（Cert番号があれば補足）
                         set_name = card_info.get("set_name", "")
                         display_name = f"{card_name}（{set_name}）" if set_name else card_name
+                        cert_suffix = f" (PSA Cert: {cert_number})" if cert_number else ""
                         await message.reply(f"{BOT_PREFIX}💰 **{display_name} {grade}** の価格をメルカリ・スニダン・eBayで検索しています...")
-                        search_prompt = f"{display_name} {grade} の直近の取引価格をメルカリ・スニダン・eBayで調べてください。"
+                        search_prompt = f"{display_name} {grade}{cert_suffix} の直近の取引価格をメルカリ・スニダン・eBayで調べてください。"
+                    elif cert_number:
+                        # カード名不明だがCert番号あり → Cert番号で検索
+                        await message.reply(f"{BOT_PREFIX}💰 PSA Cert **{cert_number}** の価格をメルカリ・スニダン・eBayで検索しています...")
+                        search_prompt = f"PSA Cert番号 {cert_number} のポケモンカードを特定して、メルカリ・スニダン・eBayの直近の取引価格（売り切れ実績）を調べてください。"
                     else:
                         search_prompt = None
 
