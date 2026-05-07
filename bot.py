@@ -25,8 +25,7 @@ ANTHROPIC_API_KEY = os.environ['ANTHROPIC_API_KEY']
 DATABASE_URL = os.environ['DATABASE_URL']
 GOOGLE_MAPS_API_KEY = os.environ.get('GOOGLE_MAPS_API_KEY', '')
 AQUAVOICE_API_KEY = os.environ.get('AQUAVOICE_API_KEY', '')
-PSA_USERNAME = os.environ.get('PSA_USERNAME', '')
-PSA_PASSWORD = os.environ.get('PSA_PASSWORD', '')
+PSA_ACCESS_TOKEN = os.environ.get('PSA_ACCESS_TOKEN', '')
 JARVIS_LOG_CHANNEL_ID = os.environ.get('JARVIS_LOG_CHANNEL_ID', '')
 PORT = int(os.environ.get('PORT', 8080))
 _raw_base_url = os.environ.get('BOT_BASE_URL', '')
@@ -921,31 +920,8 @@ def _ocr_cert_number(image_contents: list) -> str | None:
 
 
 def _psa_get_token() -> str | None:
-    """PSA公開APIのOAuth2トークンを取得・キャッシュして返す"""
-    global _psa_token, _psa_token_expires
-    if _psa_token and time.time() < _psa_token_expires - 60:
-        return _psa_token
-    if not PSA_USERNAME or not PSA_PASSWORD:
-        return None
-    try:
-        resp = requests.post(
-            'https://api.psacard.com/publicapi/token',
-            data={
-                'grant_type': 'password',
-                'username': PSA_USERNAME,
-                'password': PSA_PASSWORD,
-            },
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        _psa_token = data['access_token']
-        _psa_token_expires = time.time() + data.get('expires_in', 3600)
-        print(f"PSAトークン取得成功")
-        return _psa_token
-    except Exception as e:
-        print(f"PSAトークン取得エラー: {e}")
-        return None
+    """PSA公開APIのトークンを返す（環境変数から直接取得）"""
+    return PSA_ACCESS_TOKEN if PSA_ACCESS_TOKEN else None
 
 
 def _psa_lookup_cert(cert_number: str) -> dict:
@@ -1004,8 +980,14 @@ def _identify_card(image_contents: list) -> dict:
         if cert_number:
             print(f"OCRでCert番号取得: {cert_number}")
 
-    # Step 3: Cert番号があればそのまま返す（web_searchで照会させる）
+    # Step 3: Cert番号があればPSA API照会（トークンあり）、なければweb_search用にそのまま返す
     if cert_number:
+        if PSA_ACCESS_TOKEN:
+            result = _psa_lookup_cert(cert_number)
+            if "error" not in result:
+                print(f"PSA API照会成功: {result}")
+                return result
+            print(f"PSA API照会失敗: {result.get('error')} → Cert番号フォールバック")
         print(f"Cert番号確定: {cert_number} → web_searchで照会")
         return {"cert_number": cert_number, "grade": "PSA", "card_name": "", "set_name": ""}
 
