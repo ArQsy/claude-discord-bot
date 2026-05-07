@@ -17,6 +17,8 @@ import requests
 from aiohttp import web
 import speech_recognition as sr
 from pydub import AudioSegment
+import zxingcpp
+from PIL import Image
 
 DISCORD_BOT_TOKEN = os.environ['DISCORD_BOT_TOKEN']
 ANTHROPIC_API_KEY = os.environ['ANTHROPIC_API_KEY']
