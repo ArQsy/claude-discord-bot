@@ -867,6 +867,23 @@ def split_message(text, limit=2000):
     return chunks
 
 
+def _identify_card(image_contents: list) -> dict:
+    """Haiku + Vision で画像からカード情報を識別する。同期関数（executor経由で呼ぶ）"""
+    try:
+        response = anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=150,
+            system=CARD_ID_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": image_contents + [{"type": "text", "text": "このカードの情報をJSONで教えてください。"}]}],
+        )
+        raw = response.content[0].text.strip()
+        raw = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw, flags=re.MULTILINE).strip()
+        return json.loads(raw)
+    except Exception as e:
+        print(f"カード識別エラー: {e}")
+        return {"error": str(e)}
+
+
 async def _send_places_result(channel, places, lat, lng, keyword, radius, open_now, loop, reference=None, location_name=None):
     """地図検索結果テキスト＋写真をDiscordに送信"""
     cid = str(channel.id)
