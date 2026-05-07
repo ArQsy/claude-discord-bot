@@ -1675,11 +1675,13 @@ async def on_message(message):
                                 model="claude-sonnet-4-6",
                                 max_tokens=1200,
                                 system=PSA_PRICE_SYSTEM_PROMPT,
-                                tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
+                                tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
                                 messages=[{"role": "user", "content": search_prompt}],
                             )
                         response = await loop.run_in_executor(None, _call_psa_price)
-                        reply_text = next((b.text for b in response.content if hasattr(b, 'text')), "価格情報が見つかりませんでした。カード名を直接テキストで教えてください。")
+                        reply_text = "".join(b.text for b in response.content if hasattr(b, 'text'))
+                        if not reply_text:
+                            reply_text = "価格情報が見つかりませんでした。カード名を直接テキストで教えてください。"
                         for chunk in split_message(BOT_PREFIX + reply_text):
                             await message.reply(chunk)
                         return
@@ -1696,7 +1698,9 @@ async def on_message(message):
                         messages=[{"role": "user", "content": user_content}],
                     )
                 response = await loop.run_in_executor(None, _call_card_price)
-                reply_text = next((b.text for b in response.content if hasattr(b, 'text')), "カードの特定または価格検索に失敗しました。")
+                reply_text = "".join(b.text for b in response.content if hasattr(b, 'text'))
+                if not reply_text:
+                    reply_text = "カードの特定または価格検索に失敗しました。"
                 for chunk in split_message(BOT_PREFIX + reply_text):
                     await message.reply(chunk)
                 return
