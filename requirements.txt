@@ -5,5 +5,5 @@ SpeechRecognition>=3.10.0
 pydub>=0.25.1
 requests>=2.31.0
 aiohttp>=3.9.0
-zxingcpp>=2.2.0
+zxing-cpp>=2.2.0
 Pillow>=10.0.0
