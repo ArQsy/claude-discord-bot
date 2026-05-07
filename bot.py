@@ -25,6 +25,8 @@ ANTHROPIC_API_KEY = os.environ['ANTHROPIC_API_KEY']
 DATABASE_URL = os.environ['DATABASE_URL']
 GOOGLE_MAPS_API_KEY = os.environ.get('GOOGLE_MAPS_API_KEY', '')
 AQUAVOICE_API_KEY = os.environ.get('AQUAVOICE_API_KEY', '')
+PSA_USERNAME = os.environ.get('PSA_USERNAME', '')
+PSA_PASSWORD = os.environ.get('PSA_PASSWORD', '')
 JARVIS_LOG_CHANNEL_ID = os.environ.get('JARVIS_LOG_CHANNEL_ID', '')
 PORT = int(os.environ.get('PORT', 8080))
 _raw_base_url = os.environ.get('BOT_BASE_URL', '')
@@ -36,6 +38,9 @@ _PENDING_LOCATION_TTL = 600  # 10分
 
 # 直前の検索結果キャッシュ {channel_id: (places, lat, lng)}
 _last_places_cache: dict[str, tuple] = {}
+
+_psa_token: str | None = None
+_psa_token_expires: float = 0.0
 
 JST = timezone(timedelta(hours=9))
 
@@ -204,6 +209,17 @@ PSA_PRICE_SYSTEM_PROMPT = """指定されたポケモンカードのグレード
 - 価格が見つからないプラットフォームは「情報なし」と記載
 - 検索クエリ例:「メルカリ PSA10 {card_name} 売り切れ」「eBay PSA 10 {card_name} sold completed」「スニダン {card_name} PSA」
 - 円とドルが混在する場合は1ドル=150円で換算して併記する"""
+
+CERT_OCR_SYSTEM_PROMPT = """PSAスラブ（グレーディングケース）の画像から、Cert番号（認証番号）を読み取ってください。
+
+Cert番号は通常：
+- PSAラベルに印刷された6〜10桁の数字
+- 「CERT」「No.」「#」などの近くにある
+- バーコードの下に印刷されていることが多い
+
+数字のみを返してください。例: 12345678
+
+読み取れない場合は「不明」とだけ返してください。"""
 
 
 # ───────────── DB ─────────────
