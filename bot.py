@@ -872,7 +872,7 @@ def _identify_card(image_contents: list) -> dict:
     try:
         response = anthropic_client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=150,
+            max_tokens=300,
             system=CARD_ID_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": image_contents + [{"type": "text", "text": "このカードの情報をJSONで教えてください。"}]}],
         )
@@ -1523,6 +1523,7 @@ async def on_message(message):
                         # PSA/BGS/CGC グレード確認 → 専用価格検索
                         set_name = card_info.get("set_name", "")
                         display_name = f"{card_name}（{set_name}）" if set_name else card_name
+                        await message.reply(f"{BOT_PREFIX}💰 **{display_name} {grade}** の価格をメルカリ・スニダン・eBayで検索しています...")
                         search_prompt = f"{display_name} {grade} の直近の取引価格をメルカリ・スニダン・eBayで調べてください。"
 
                         def _call_psa_price():
@@ -1538,6 +1539,8 @@ async def on_message(message):
                         for chunk in split_message(BOT_PREFIX + reply_text):
                             await message.reply(chunk)
                         return
+                    else:
+                        await message.reply(f"{BOT_PREFIX}🔍 グレーディングなし、または識別できませんでした。通常検索で調べます...")
 
                 # グレードなし or 識別失敗 → 既存フロー（web_search で一般検索）
                 def _call_card_price():
